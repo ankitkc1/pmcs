@@ -4,7 +4,6 @@ import random
 import numpy as np
 import time
 import collections
-from torch import nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from datetime import datetime
@@ -15,7 +14,7 @@ from dataset.data_utils import init_fn
 import copy
 
 
-from models import model
+from models.fusion_net import FusionSegNet
 from utils.fl_utils import avg_EW
 from utils.lr_scheduler import LR_Scheduler
 from utils import criterions
@@ -24,6 +23,43 @@ from options import args_parser
 from utils.predict import local_test
 
 MODAL_NAMES = ['flair', 't1ce', 't1', 't2']
+
+MODALITY_MASK_PRESETS = {
+    'm3': {
+        'masks': [[True, True, True, True], [True, True, True, False], [True, False, True, True], [True, True, False, True], [False, True, True, True]],
+    },
+    'm2': {
+        'masks': [[True, True, True, True], [True, True, False, False], [False, True, False, True], [True, False, False, True], [False, True, True, False], [False, False, True, True], [True, False, True, False]],
+    },
+    'm1': {
+        'masks': [[True, True, True, True], [True, False, False, False], [False, True, False, False], [False, False, True, False], [False, False, False, True]],
+    },
+    'c8': {
+        'masks': [[True, True, True, True], [True, True, True, False], [True, False, True, True], [True, True, False, False], [False, False, True, True],
+                  [False, True, False, False], [False, False, False, True], [True, True, True, True], [True, True, True, True]],
+    },
+}
+
+
+def resolve_modality_masks(setting_options):
+    for key, preset in MODALITY_MASK_PRESETS.items():
+        if key in setting_options:
+            return preset['masks']
+    raise ValueError('no modality-mask preset matches setting_options={!r}'.format(setting_options))
+
+
+def build_client_split_files(setting_options, dataname, client_num):
+    """
+    Map client index (1-based) -> local split csv under ./split. Two client
+    counts of the BRATS c8 heterogeneous-modality-count setup ship with the
+    repo (18 subjects for BRATS2018, 20 for BRATS2020); anything else falls
+    back to the smaller 4-client/6-client layout.
+    """
+    if 'c8' in setting_options:
+        subdir = '20_c8_heter_modalnum' if dataname == 'BRATS2020' else '18_c8_heter_modalnum'
+    else:
+        subdir = '18_c4_c6'
+    return {i: os.path.join('split', subdir, 'c{}.csv'.format(i)) for i in range(1, client_num + 1)}
 
 
 def self_cuda(obj, device):
@@ -92,11 +128,8 @@ def local_training(args, device, mask, dataloader, model, client_idx, round, opt
                 prm_dice_loss += criterions.dice_loss(prm_pred, msk_batch, num_cls=args.num_class)
             prm_loss = prm_cross_loss + prm_dice_loss
 
-            flair_pred = model.decoder_sep(*per_modal[0])
-            t1ce_pred = model.decoder_sep(*per_modal[1])
-            t1_pred = model.decoder_sep(*per_modal[2])
-            t2_pred = model.decoder_sep(*per_modal[3])
-            sep_preds = torch.stack((flair_pred, t1ce_pred, t1_pred, t2_pred), dim=0)[mask, ...]
+            per_modal_preds = torch.stack([model.modality_decoder(*feats) for feats in per_modal], dim=0)
+            sep_preds = per_modal_preds[mask, ...]
 
             sep_cross_loss = torch.zeros(1).float().to(device)
             sep_dice_loss = torch.zeros(1).float().to(device)
@@ -145,9 +178,9 @@ def local_training(args, device, mask, dataloader, model, client_idx, round, opt
 
 
     model = model.cpu()
-    encoders = [model.c1_encoder.state_dict(), model.c2_encoder.state_dict(),
-                model.c3_encoder.state_dict(), model.c4_encoder.state_dict()]
-    decoder = model.decoder_fuse.state_dict()
+    encoders = [model.flair_encoder.state_dict(), model.t1ce_encoder.state_dict(),
+                model.t1_encoder.state_dict(), model.t2_encoder.state_dict()]
+    decoder = model.fusion_decoder.state_dict()
     return encoders, decoder, epoch_loss, model, optimizer.state_dict()
 
 
@@ -186,13 +219,13 @@ def aggregate_decoder(local_decoders, active_clients):
 
 def broadcast_weights(model_clients, global_encoders, global_decoder_prior):
     for m in model_clients:
-        m.c1_encoder.load_state_dict(global_encoders[0])
-        m.c2_encoder.load_state_dict(global_encoders[1])
-        m.c3_encoder.load_state_dict(global_encoders[2])
-        m.c4_encoder.load_state_dict(global_encoders[3])
+        m.flair_encoder.load_state_dict(global_encoders[0])
+        m.t1ce_encoder.load_state_dict(global_encoders[1])
+        m.t1_encoder.load_state_dict(global_encoders[2])
+        m.t2_encoder.load_state_dict(global_encoders[3])
         # residual FusionAdapter params are absent from global_decoder_prior
         # and therefore left untouched (never downloaded either).
-        m.decoder_fuse.load_state_dict(global_decoder_prior, strict=False)
+        m.fusion_decoder.load_state_dict(global_decoder_prior, strict=False)
 
 
 def log_round_stats(round, contributor_counts, agg_state, writer=None):
@@ -213,11 +246,11 @@ def log_round_stats(round, contributor_counts, agg_state, writer=None):
 
 
 if __name__ == '__main__':
-    ### local model - 模态特异Encoder & 模态融合Decoder(prior，全局聚合) + FusionAdapter(residual，本地私有)
-    ### FL过程中：Encoder按模态聚合，Decoder的prior部分全量聚合，residual部分从不上传
+    ### client model = 4 modality-specific encoders + FusionDecoder(prior, aggregated every round) + FusionAdapter(residual, local-only)
+    ### encoders are FedAvg'd per modality; the fusion decoder's prior is FedAvg'd across all clients; the adapter residual never leaves the client.
     args = args_parser()
 
-    # 数据预处理遵循RFNet
+    # data preprocessing follows the RFNet augmentation recipe
     args.train_transforms = 'Compose([RandCrop3D((80,80,80)), RandomRotion(10), RandomIntensityChange((0.1,0.1)), RandomFlip(0), NumpyType((np.float32, np.int64)),])'
     args.test_transforms = 'Compose([NumpyType((np.float32, np.int64)),])'
 
@@ -239,61 +272,15 @@ if __name__ == '__main__':
 
     writer = SummaryWriter(os.path.join(args.save_path, 'TBlog'))
 
-    ##### modality missing mask
-    if "m3" in args.setting_options:
-        masks = [[True, True, True, True], [True, True, True,False], [True, False, True, True], [True, True, False, True], [False, True, True, True]]
-        mask_name = ['flairt1cet1t2', 'flairt1cet1', 'flairt1cet2', 'flairt1t2', 't1cet1t2']
-    elif "m2" == args.setting_options:
-        masks = [[True, True, True, True], [True, True, False,False],  [False, True, False, True], [True, False, False, True], [False, True, True, False], [False, False, True, True], [True, False, True, False]]
-        mask_name = ['flairt1cet1t2', 'flairt1ce', 't1t2', 'flairt1', 't1cet2', 'flairt2', 't1cet1']
-    elif "m1" in args.setting_options:
-        masks = [[True, True, True, True], [True, False, False,False], [False, True, False, False], [False, False, True, False], [False, False, False, True]]
-        mask_name = ['flairt1cet1t2', 'flair', 't1ce', 't1', 't2']
-    elif "c8" in args.setting_options:
-        masks = [[True, True, True, True], [True,  True, True,  False], [True,  False, True,  True], [True, True, False, False], [False, False, True, True],
-             [False, True, False, False], [False, False, False, True], [True,  True,  True, True], [True,  True,  True, True]]
-        mask_name = ['m1111', 'm1110', 'm1011', 'm1100', 'm0011', 'm0100', 'm0001', 'm1111', 'm1111']
-
-    if "c8" in args.setting_options:
-        if args.dataname == "BRATS2020":
-            args.train_file = {1:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/20_c8_heter_modalnum/c1.csv",
-                                    2:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/20_c8_heter_modalnum/c2.csv",
-                                    3:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/20_c8_heter_modalnum/c3.csv",
-                                    4:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/20_c8_heter_modalnum/c4.csv",
-                                    5:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/20_c8_heter_modalnum/c5.csv",
-                                    6:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/20_c8_heter_modalnum/c6.csv",
-                                    7:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/20_c8_heter_modalnum/c7.csv",
-                                    8:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/20_c8_heter_modalnum/c8.csv"}
-        else:
-            args.train_file = {1:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/18_c8_heter_modalnum/c1.csv",
-                                    2:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/18_c8_heter_modalnum/c2.csv",
-                                    3:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/18_c8_heter_modalnum/c3.csv",
-                                    4:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/18_c8_heter_modalnum/c4.csv",
-                                    5:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/18_c8_heter_modalnum/c5.csv",
-                                    6:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/18_c8_heter_modalnum/c6.csv",
-                                    7:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/18_c8_heter_modalnum/c7.csv",
-                                    8:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/split/18_c8_heter_modalnum/c8.csv"}
-    else:
-        args.train_file = {1:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/FedMEMA_pure_code/split/18_c4_c6/c1.csv",
-                2:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/FedMEMA_pure_code/split/18_c4_c6/c2.csv",
-                3:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/FedMEMA_pure_code/split/18_c4_c6/c3.csv",
-                4:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/FedMEMA_pure_code/split/18_c4_c6/c4.csv",
-                5:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/FedMEMA_pure_code/split/18_c4_c6/c5.csv",
-                6:"/apdcephfs_cq10/share_1290796/lh/FedMEMA/FedMEMA_pure_code/split/18_c4_c6/c6.csv"
-                }
-
-        args.valid_file = "/apdcephfs_cq10/share_1290796/lh/FedMEMA/FedMEMA_pure_code/split/18_c4_c6/val.csv"
-        args.test_file = "/apdcephfs_cq10/share_1290796/lh/FedMEMA/FedMEMA_pure_code/split/18_c4_c6/test.csv"
+    ##### modality-availability presets and per-client split files
+    masks = resolve_modality_masks(args.setting_options)
+    args.train_file = build_client_split_files(args.setting_options, args.dataname, args.client_num)
 
     masks_torch = torch.from_numpy(np.array(masks))
-    mask_name = ['flair', 't1ce', 't1', 't2']
     logging.info(masks_torch.int())
 
     ########## setting seed for deterministic
     if args.deterministic:
-        # cudnn.enabled = False
-        # cudnn.benchmark = False
-        # cudnn.deterministic = True
         random.seed(args.seed)
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -309,7 +296,7 @@ if __name__ == '__main__':
         args.local_devices.append(torch.device('cuda:{}'.format(i%4))) # use 4 gpus
 
     ########## setting model
-    client_model = model.E4D4Model(num_cls=args.num_class)
+    client_model = FusionSegNet(num_cls=args.num_class)
 
     lr_schedule = LR_Scheduler(args.lr, args.c_rounds)
     ########## FL setting ##########
@@ -318,18 +305,16 @@ if __name__ == '__main__':
     model_clients = []
     optimizer_clients = []
 
-    modal_list = ['flair', 't1ce', 't1', 't2']
     logging.info(str(args))
 
     for client_idx in range(args.client_num):
-        chose_modal = 'all'
         lc_train_file = args.train_file[client_idx+1]
         data_set = Brats_train(transforms=args.train_transforms, root=args.datapath,
-                                modal=chose_modal, num_cls=args.num_class, train_file=lc_train_file)
+                                modal='all', num_cls=args.num_class, train_file=lc_train_file)
         data_loader = DataLoader(dataset=data_set, batch_size=args.batch_size,
                                 pin_memory=True, shuffle=True, worker_init_fn=init_fn)
         valid_set = Brats_test(transforms=args.test_transforms, root=args.datapath,
-                                modal=chose_modal, test_file=lc_train_file)
+                                modal='all', test_file=lc_train_file)
         valid_loader = DataLoader(dataset=valid_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
         test_loader = valid_loader
 
@@ -347,15 +332,13 @@ if __name__ == '__main__':
         logging.info('Client-{} : Brats dataset with modal {}'.format(client_idx+1, masks[client_idx]))
         logging.info('the length of Brats dataset is {} : {}'.format(len(data_set), len(valid_set)))
 
-        device = args.local_devices[client_idx]
-
     best_dices = [0.0] * args.client_num
 
     ########## bookkeeping for federated aggregation of the modality encoders
-    global_encoders = [client_model.c1_encoder.state_dict(), client_model.c2_encoder.state_dict(),
-                        client_model.c3_encoder.state_dict(), client_model.c4_encoder.state_dict()]
+    global_encoders = [client_model.flair_encoder.state_dict(), client_model.t1ce_encoder.state_dict(),
+                        client_model.t1_encoder.state_dict(), client_model.t2_encoder.state_dict()]
     global_decoder_prior = collections.OrderedDict(
-        (k, v) for k, v in client_model.decoder_fuse.state_dict().items() if not k.endswith('_residual'))
+        (k, v) for k, v in client_model.fusion_decoder.state_dict().items() if not k.endswith('_residual'))
     agg_state = {
         'client_num': args.client_num,
         'update_count': [0, 0, 0, 0],
