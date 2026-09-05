@@ -1,4 +1,5 @@
 import torch
+torch.multiprocessing.set_sharing_strategy("file_system")
 import os
 import random
 import numpy as np
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from datetime import datetime
 import logging
+import distutils.version
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from dataset.data_utils import init_fn
@@ -59,7 +61,7 @@ def build_client_split_files(setting_options, dataname, client_num):
         subdir = '20_c8_heter_modalnum' if dataname == 'BRATS2020' else '18_c8_heter_modalnum'
     else:
         subdir = '18_c4_c6'
-    return {i: os.path.join('split', subdir, 'c{}.csv'.format(i)) for i in range(1, client_num + 1)}
+    return {i: os.path.abspath(os.path.join('split', subdir, 'c{}.csv'.format(i))) for i in range(1, client_num + 1)}
 
 
 def self_cuda(obj, device):
@@ -101,6 +103,18 @@ def local_training(args, device, mask, dataloader, model, client_idx, round, opt
     n_present = int(mask.sum().item())
     present_idx = mask.nonzero(as_tuple=True)[0].tolist()
 
+    # Round-wise learning-rate decay to reduce late-round
+    # oscillation under heterogeneous non-IID clients.
+    if round >= 40:
+        current_lr = 5e-5
+    elif round >= 30:
+        current_lr = 1e-4
+    else:
+        current_lr = args.lr
+
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = current_lr
+
     for iter in range(args.local_ep):
         batch_loss = {'total':[], 'fuse':[], 'prm':[], 'sep':[], 'sd':[]}
 
@@ -110,6 +124,7 @@ def local_training(args, device, mask, dataloader, model, client_idx, round, opt
             names = data[-1]
             msk = torch.unsqueeze(mask, dim=0).repeat(len(names), 1)  # [B, 4], already on device
             model.is_training = True
+            optimizer.zero_grad(set_to_none=True)
 
             # encode once
             x1, x2, x3, x4, per_modal = model.encode(vol_batch)
@@ -141,21 +156,46 @@ def local_training(args, device, mask, dataloader, model, client_idx, round, opt
 
             loss = fuse_loss + prm_loss + sep_loss
 
-            # modality-dropout self-distillation: student decode with one
-            # present modality randomly dropped, distilled from the teacher's
-            # fused representation. Skipped for single-modality clients.
+            # Normalized cosine modality-dropout self-distillation.
+            # Teacher uses all modalities available to the client.
+            # Student randomly drops one available modality.
             if n_present > 1:
                 drop_idx = random.choice(present_idx)
                 student_msk = msk.clone()
                 student_msk[:, drop_idx] = False
-                _, _, _, fused_repr_student = model.decode(x1, x2, x3, x4, student_msk)
-                sd_loss = F.mse_loss(fused_repr_student, fused_repr.detach())
-                loss = loss + args.lam_sd * sd_loss
+
+                _, _, _, fused_repr_student = model.decode(
+                    x1, x2, x3, x4, student_msk
+                )
+
+                teacher_repr = F.normalize(
+                    fused_repr.detach(), p=2, dim=1, eps=1e-6
+                )
+                student_repr = F.normalize(
+                    fused_repr_student, p=2, dim=1, eps=1e-6
+                )
+
+                sd_loss = 1.0 - F.cosine_similarity(
+                    student_repr, teacher_repr, dim=1
+                ).mean()
+
+                sd_warmup = 10
+                sd_ramp = 20
+
+                if round < sd_warmup:
+                    lambda_sd = 0.0
+                else:
+                    lambda_sd = args.lam_sd * min(
+                        1.0,
+                        (round - sd_warmup + 1) / float(sd_ramp)
+                    )
+
+                loss = loss + lambda_sd * sd_loss
             else:
                 sd_loss = torch.zeros(1).float().to(device)
 
-            optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
 
 
@@ -178,10 +218,26 @@ def local_training(args, device, mask, dataloader, model, client_idx, round, opt
 
 
     model = model.cpu()
-    encoders = [model.flair_encoder.state_dict(), model.t1ce_encoder.state_dict(),
-                model.t1_encoder.state_dict(), model.t2_encoder.state_dict()]
+
+    encoders = [
+        model.flair_encoder.state_dict(),
+        model.t1ce_encoder.state_dict(),
+        model.t1_encoder.state_dict(),
+        model.t2_encoder.state_dict()
+    ]
+
     decoder = model.fusion_decoder.state_dict()
-    return encoders, decoder, epoch_loss, model, optimizer.state_dict()
+    model_state = model.state_dict()
+
+    # Return optimizer state on CPU to avoid CUDA IPC memory retention.
+    optimizer_state = optimizer.state_dict()
+    for state in optimizer_state["state"].values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.cpu()
+
+
+    return encoders, decoder, epoch_loss, model_state, optimizer_state
 
 
 def aggregate_encoders(local_encoders, active_clients, masks_torch, global_encoders):
@@ -376,12 +432,11 @@ if __name__ == '__main__':
 
         num_active = len(active_clients)
         branch_num = num_active // args.num_devices
-        if branch_num % args.num_devices:
+        if num_active % args.num_devices:
             branch_num += 1
 
         for branch in range(branch_num):
 
-            torch.cuda.empty_cache()
             ctx = torch.multiprocessing.get_context("spawn")
 
             pool = ctx.Pool(args.num_devices)
@@ -402,10 +457,10 @@ if __name__ == '__main__':
 
         logging.info("client training: {}".format(time.time() - start))
         for client_i, r in zip(result_client_ids, result):
-            encoders, decoder, loss, m, optim = r.get()
+            encoders, decoder, loss, model_state, optim = r.get()
             local_encoders[client_i] = encoders
             local_decoders[client_i] = decoder
-            model_clients[client_i].load_state_dict(m.state_dict())
+            model_clients[client_i].load_state_dict(model_state)
             optimizer_clients[client_i].load_state_dict(optim)
 
             writer.add_scalar('LocalTrain/total_Loss/client_' + str(client_i + 1), loss['total'], round)
@@ -430,12 +485,11 @@ if __name__ == '__main__':
             with torch.no_grad():
                 results = []
                 branch_num = args.client_num // args.num_devices
-                if branch_num % args.num_devices:
+                if args.client_num % args.num_devices:
                     branch_num += 1
 
                 for branch in range(branch_num):
 
-                    torch.cuda.empty_cache()
                     ctx = torch.multiprocessing.get_context("spawn")
 
                     pool = ctx.Pool(args.num_devices)
