@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "split_id": "B",
+  "modality_order": ["FLAIR", "T1ce", "T1", "T2"],
+  "num_clients": 8,
+  "expected_modality_pool_sizes": {
+    "FLAIR": 2,
+    "T1ce": 7,
+    "T1": 5,
+    "T2": 4
+  },
+  "global_test": {
+    "size": 50,
+    "mask": [1, 1, 1, 1],
+    "all_modalities_present": true,
+    "grade_counts": {"HGG": 40, "LGG": 10},
+    "grade_slot_ranges": {
+      "HGG": ["000-039"],
+      "LGG": ["000-009"]
+    }
+  },
+  "assignment": {
+    "data_seed": 20260905,
+    "model_seed_independent": true,
+    "algorithm": "sort_patient_ids_within_grade_then_sha256_rank_by_data_seed_v1",
+    "patient_manifest": "data/patient_manifest.csv",
+    "manifest_columns": {
+      "patient_id": "BraTS_2020_subject_ID",
+      "grade": "Grade"
+    },
+    "population_grade_counts": {"HGG": 292, "LGG": 76},
+    "expected_volume_shape": [240, 240, 155, 4],
+    "slot_format": "{grade}_{index:03d}",
+    "clients": {
+      "C1": {
+        "grade_counts": {"HGG": 32, "LGG": 8},
+        "train": {"HGG": ["040-061"], "LGG": ["010-015"]},
+        "validation": {"HGG": ["062-066"], "LGG": ["016"]},
+        "test": {"HGG": ["067-071"], "LGG": ["017"]}
+      },
+      "C2": {
+        "grade_counts": {"HGG": 32, "LGG": 8},
+        "train": {"HGG": ["072-093"], "LGG": ["018-023"]},
+        "validation": {"HGG": ["094-098"], "LGG": ["024"]},
+        "test": {"HGG": ["099-103"], "LGG": ["025"]}
+      },
+      "C3": {
+        "grade_counts": {"HGG": 32, "LGG": 8},
+        "train": {"HGG": ["104-125"], "LGG": ["026-031"]},
+        "validation": {"HGG": ["126-130"], "LGG": ["032"]},
+        "test": {"HGG": ["131-135"], "LGG": ["033"]}
+      },
+      "C4": {
+        "grade_counts": {"HGG": 32, "LGG": 8},
+        "train": {"HGG": ["136-157"], "LGG": ["034-039"]},
+        "validation": {"HGG": ["158-162"], "LGG": ["040"]},
+        "test": {"HGG": ["163-167"], "LGG": ["041"]}
+      },
+      "C5": {
+        "grade_counts": {"HGG": 31, "LGG": 9},
+        "train": {"HGG": ["168-189"], "LGG": ["042-047"]},
+        "validation": {"HGG": ["190-194"], "LGG": ["048"]},
+        "test": {"HGG": ["195-198"], "LGG": ["049-050"]}
+      },
+      "C6": {
+        "grade_counts": {"HGG": 31, "LGG": 9},
+        "train": {"HGG": ["199-220"], "LGG": ["051-056"]},
+        "validation": {"HGG": ["221-225"], "LGG": ["057"]},
+        "test": {"HGG": ["226-229"], "LGG": ["058-059"]}
+      },
+      "C7": {
+        "grade_counts": {"HGG": 31, "LGG": 8},
+        "train": {"HGG": ["230-250"], "LGG": ["060-065"]},
+        "validation": {"HGG": ["251-255"], "LGG": ["066"]},
+        "test": {"HGG": ["256-260"], "LGG": ["067"]}
+      },
+      "C8": {
+        "grade_counts": {"HGG": 31, "LGG": 8},
+        "train": {"HGG": ["261-281"], "LGG": ["068-073"]},
+        "validation": {"HGG": ["282-286"], "LGG": ["074"]},
+        "test": {"HGG": ["287-291"], "LGG": ["075"]}
+      }
+    }
+  },
+  "clients": [
+    {"id": "C1", "mask": [1, 1, 1, 1]},
+    {"id": "C2", "mask": [1, 1, 1, 0]},
+    {"id": "C3", "mask": [0, 1, 1, 1]},
+    {"id": "C4", "mask": [0, 1, 1, 0]},
+    {"id": "C5", "mask": [0, 1, 0, 1]},
+    {"id": "C6", "mask": [0, 1, 0, 0]},
+    {"id": "C7", "mask": [0, 1, 1, 0]},
+    {"id": "C8", "mask": [0, 0, 0, 1]}
+  ]
+}
