@@ -1,3 +1,4 @@
+medpy==0.5.2
 nibabel==5.3.2
 numpy==1.21.4
 Pillow==8.4.0

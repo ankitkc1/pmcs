@@ -21,8 +21,10 @@ from utils.fl_utils import avg_EW
 from utils.lr_scheduler import LR_Scheduler
 from utils import criterions
 from dataset.datasets import Brats_test, Brats_train
+from dataset.global_split import build_global_test_split
 from options import args_parser
 from utils.predict import local_test
+from utils import metrics as fedmetrics
 
 MODAL_NAMES = ['flair', 't1ce', 't1', 't2']
 
@@ -51,12 +53,7 @@ def resolve_modality_masks(setting_options):
 
 
 def build_client_split_files(setting_options, dataname, client_num):
-    """
-    Map client index (1-based) -> local split csv under ./split. Two client
-    counts of the BRATS c8 heterogeneous-modality-count setup ship with the
-    repo (18 subjects for BRATS2018, 20 for BRATS2020); anything else falls
-    back to the smaller 4-client/6-client layout.
-    """
+
     if 'c8' in setting_options:
         subdir = '20_c8_heter_modalnum' if dataname == 'BRATS2020' else '18_c8_heter_modalnum'
     else:
@@ -75,14 +72,7 @@ def self_cuda(obj, device):
 
 
 def select_clients(round, state):
-    """
-    Decide which clients participate in a given federated round.
-
-    `state` carries whatever bookkeeping a participation policy needs (e.g.
-    per-client last-participation round, for async or partial-participation
-    schemes). The default policy is full participation: every client trains
-    every round.
-    """
+  
     return list(range(state['client_num']))
 
 
@@ -390,6 +380,45 @@ if __name__ == '__main__':
 
     best_dices = [0.0] * args.client_num
 
+    ########## additional metrics (opt-in; see options.py) ##########
+    voxel_spacing = tuple(args.voxel_spacing)
+
+    private_fraction_static = {}
+    for client_idx in range(args.client_num):
+        private_fraction_static[client_idx] = fedmetrics.compute_private_fraction(client_model, masks[client_idx])
+        pf = private_fraction_static[client_idx]
+        logging.info(
+            'Client-{} private/shared params: private(R_k)={}, shared(held encoders+A0+decoder)={}, '
+            'frac_of_total_model={:.4f}, frac_of_fusion_module={:.4f}'.format(
+                client_idx + 1, pf['private_numel'], pf['shared_numel'],
+                pf['fraction_of_total_model'], pf['fraction_of_fusion_module']))
+
+    metrics_recorder = fedmetrics.MetricsRecorder(args.save_path, args.client_num)
+    metrics_recorder.init_target_tracker(args.target_dice)
+    if args.resume != 0:
+        metrics_recorder.try_resume()
+    metrics_recorder.set_static('client_modalities', {c: masks[c] for c in range(args.client_num)})
+    metrics_recorder.set_static('private_param_fraction', private_fraction_static)
+    metrics_recorder.set_static('config', {
+        'setting_options': args.setting_options, 'dataname': args.dataname, 'client_num': args.client_num,
+        'c_rounds': args.c_rounds, 'eval': args.eval, 'seed': args.seed, 'target_dice': args.target_dice,
+        'voxel_spacing': list(voxel_spacing), 'compute_hd95': args.compute_hd95,
+        'compute_pers_gain': args.compute_pers_gain, 'eval_global_model': args.eval_global_model,
+        'global_test_size': args.global_test_size, 'global_test_seed': args.global_test_seed,
+    })
+
+    global_test_loader = None
+    if args.eval_global_model:
+        split_dir = os.path.dirname(next(iter(args.train_file.values())))
+        global_test_csv = build_global_test_split(
+            datapath=args.datapath, client_split_files=args.train_file, out_dir=split_dir,
+            num_cases=args.global_test_size, seed=args.global_test_seed)
+        global_test_set = Brats_test(transforms=args.test_transforms, root=args.datapath,
+                                      modal='all', test_file=global_test_csv, all_=True)
+        global_test_loader = DataLoader(dataset=global_test_set, batch_size=1, shuffle=False,
+                                         num_workers=0, pin_memory=True)
+        logging.info('global held-out test split: {} cases from {}'.format(len(global_test_set), global_test_csv))
+
     ########## bookkeeping for federated aggregation of the modality encoders
     global_encoders = [client_model.flair_encoder.state_dict(), client_model.t1ce_encoder.state_dict(),
                         client_model.t1_encoder.state_dict(), client_model.t2_encoder.state_dict()]
@@ -463,6 +492,8 @@ if __name__ == '__main__':
             model_clients[client_i].load_state_dict(model_state)
             optimizer_clients[client_i].load_state_dict(optim)
 
+            metrics_recorder.comm.record_upload(client_i, round, encoders, decoder, masks[client_i])
+
             writer.add_scalar('LocalTrain/total_Loss/client_' + str(client_i + 1), loss['total'], round)
             writer.add_scalar('LocalTrain/Loss_fuse/client_' + str(client_i + 1), loss['fuse'], round)
             writer.add_scalar('LocalTrain/Loss_prm/client_' + str(client_i + 1), loss['prm'], round)
@@ -479,11 +510,15 @@ if __name__ == '__main__':
 
         broadcast_weights(model_clients, global_encoders, global_decoder_prior)
 
+        for client_i in range(args.client_num):
+            metrics_recorder.comm.record_download(client_i, round, global_encoders, global_decoder_prior)
+
         ##### Eval the model after aggregation and every args.eval rounds
         if (round+1)%args.eval==0:
             logging.info('-'*20 + 'Test All the Models per 10 round'+ '-'*20)
             with torch.no_grad():
                 results = []
+                dice_matrix = [None] * args.client_num
                 branch_num = args.client_num // args.num_devices
                 if args.client_num % args.num_devices:
                     branch_num += 1
@@ -507,6 +542,7 @@ if __name__ == '__main__':
 
                 for c, result in enumerate(results):
                     dice_score = result.get()
+                    dice_matrix[c] = dice_score
                     c_model = model_clients[c]
                     avgdice_score = sum(dice_score)/len(dice_score)
                     logging.info('--- Eval at round_{}, Avg_Scores: {:.4f}, cls_Dice: {}'
@@ -520,6 +556,88 @@ if __name__ == '__main__':
                             'dice': dice_score,
                             'state_dict': c_model.state_dict(),
                         }, args.modelfile_path + '/client-%d_round_%d_model_best.pth'%(c+1, round))
+
+                ##### structured metrics.json/.csv -- additive only, never feeds back into
+                ##### training/aggregation/best_dices/checkpointing above.
+                round_payload = {
+                    'dice_matrix': [list(map(float, dice_matrix[c])) for c in range(args.client_num)],
+                    'comm_per_client': metrics_recorder.comm.round_totals(round),
+                }
+
+                variation = fedmetrics.client_dice_variation(dice_matrix)
+                round_payload['client_variation'] = variation
+                logging.info(
+                    '--- Eval at round_{}, client-Dice variation: std={:.4f} range={:.4f} '
+                    'best=client_{} ({:.4f}) worst=client_{} ({:.4f})'.format(
+                        round, variation['mean_dice_std'], variation['mean_dice_range'],
+                        variation['best_client'] + 1, variation['best_client_mean_dice'],
+                        variation['worst_client'] + 1, variation['worst_client_mean_dice']))
+
+                if args.compute_hd95:
+                    hd95_results = fedmetrics.run_pooled(
+                        args, list(range(args.client_num)), fedmetrics.evaluate_client,
+                        lambda c: (args, validloader_clients[c], model_clients[c], args.local_devices[c],
+                                   masks[c], True, voxel_spacing))
+                    hd95_matrix = [hd95_results[c]['hd95'] for c in range(args.client_num)]
+                    round_payload['hd95_matrix'] = [list(map(float, v)) for v in hd95_matrix]
+                    round_payload['hd95_edge_counts'] = {c: hd95_results[c]['edge_counts'] for c in range(args.client_num)}
+                    for c in range(args.client_num):
+                        logging.info('--- Eval at round_{}, client_{} HD95(mm): {} | edge cases: {}'.format(
+                            round, c + 1, hd95_results[c]['hd95'], hd95_results[c]['edge_counts']))
+
+                if args.compute_pers_gain:
+                    zero_models = {c: fedmetrics.zero_residual_copy(model_clients[c]) for c in range(args.client_num)}
+                    pers_results = fedmetrics.run_pooled(
+                        args, list(range(args.client_num)), fedmetrics.evaluate_client,
+                        lambda c: (args, validloader_clients[c], zero_models[c], args.local_devices[c],
+                                   masks[c], False, voxel_spacing))
+                    gain_matrix = [dice_matrix[c] - pers_results[c]['dice'] for c in range(args.client_num)]
+                    round_payload['personalisation_gain_matrix'] = [list(map(float, v)) for v in gain_matrix]
+                    for c in range(args.client_num):
+                        logging.info('--- Eval at round_{}, client_{} personalisation gain (with R_k - without R_k): {}'.format(
+                            round, c + 1, gain_matrix[c]))
+
+                if args.eval_global_model:
+                    global_model = FusionSegNet(num_cls=args.num_class)
+                    global_model.flair_encoder.load_state_dict(global_encoders[0])
+                    global_model.t1ce_encoder.load_state_dict(global_encoders[1])
+                    global_model.t1_encoder.load_state_dict(global_encoders[2])
+                    global_model.t2_encoder.load_state_dict(global_encoders[3])
+                    global_model.fusion_decoder.load_state_dict(global_decoder_prior, strict=False)
+
+                    # dispatch the per-client pooled eval first, while global_model is
+                    # still CPU-resident -- each spawned worker pickles its own copy,
+                    # so this never mutates the parent's global_model in place.
+                    global_on_client_results = fedmetrics.run_pooled(
+                        args, list(range(args.client_num)), fedmetrics.evaluate_client,
+                        lambda c: (args, validloader_clients[c], global_model, args.local_devices[c],
+                                   masks[c], False, voxel_spacing))
+                    global_minus_client = {
+                        c: (global_on_client_results[c]['dice'] - dice_matrix[c]) for c in range(args.client_num)
+                    }
+                    round_payload['global_minus_client'] = {
+                        c: list(map(float, global_minus_client[c])) for c in range(args.client_num)}
+                    for c in range(args.client_num):
+                        logging.info('--- Eval at round_{}, client_{} global_minus_client (own modalities): {}'.format(
+                            round, c + 1, global_minus_client[c]))
+
+                    # runs in-process (not pooled), so it's fine that evaluate_client
+                    # moves global_model onto args.device in place -- nothing reuses
+                    # this object afterwards.
+                    global_test_result = fedmetrics.evaluate_client(
+                        args, global_test_loader, global_model, args.device,
+                        [True, True, True, True], True, voxel_spacing)
+                    round_payload['global_model'] = {
+                        'dice': list(map(float, global_test_result['dice'])),
+                        'hd95': list(map(float, global_test_result['hd95'])),
+                        'edge_counts': global_test_result['edge_counts'],
+                        'n_cases': global_test_result['n_cases'],
+                    }
+                    logging.info('--- Eval at round_{}, GLOBAL model on held-out global test set: Dice={} HD95(mm)={}'.format(
+                        round, global_test_result['dice'], global_test_result['hd95']))
+
+                metrics_recorder.record_round(round, round_payload)
+                metrics_recorder.flush()
 
         logging.info('*'*10+'FL train a round total time: {:.4f} hours'.format((time.time() - start)/3600)+'*'*10)
         if (round+1)%args.eval == 0:

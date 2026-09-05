@@ -32,5 +32,23 @@ def args_parser():
     parser.add_argument('--resume_path', default="", type=str, help='checkpoint to load for inference')
     parser.add_argument('--maskid', default=0, type=int, help='which modality-availability preset row to evaluate')
 
+    # additional metrics (all opt-in; none of these change training/aggregation/data loading)
+    parser.add_argument('--compute_hd95', action='store_true',
+                         help='additionally compute 95th-percentile Hausdorff distance (mm) per region/client/round; requires medpy')
+    parser.add_argument('--compute_pers_gain', action='store_true',
+                         help="additionally evaluate every client with its private residual R_k zeroed (A0-only), to measure "
+                              "personalisation gain = dice_with_Rk - dice_without_Rk; roughly doubles eval cost")
+    parser.add_argument('--eval_global_model', action='store_true',
+                         help='additionally build a global model (global encoders + A0, R=0, shared decoder) and evaluate it '
+                              "on a held-out global test split and on every client's own test split")
+    parser.add_argument('--target_dice', nargs='+', type=float, default=[50, 55, 60, 65],
+                         help='mean-Dice(%%) targets to report the first eval round each one is reached at')
+    parser.add_argument('--global_test_size', type=int, default=50,
+                         help='number of held-out cases in the global test split (only used the first time it is created)')
+    parser.add_argument('--global_test_seed', type=int, default=42,
+                         help='seed for the deterministic global test split selection')
+    parser.add_argument('--voxel_spacing', nargs=3, type=float, default=[1.0, 1.0, 1.0],
+                         help='voxel spacing in mm (H, W, D) of the preprocessed volumes, used for HD95')
+
     args = parser.parse_args()
     return args
