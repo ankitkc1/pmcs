@@ -18,6 +18,10 @@ def args_parser():
 
     # Federated learning settings
     parser.add_argument('--setting_options', default="c8", type=str, help="modality-availability preset: m1 / m2 / m3 / c8")
+    parser.add_argument('--split_config', default="", type=str,
+                        help='materialized Split A/B config; overrides setting_options and legacy client CSVs')
+    parser.add_argument('--data_seed', default=20260905, type=int,
+                        help='patient-assignment seed, deliberately independent of --seed')
     parser.add_argument('--gpus', default='1,2,3,4', help="To use cuda, set to a specific GPU ID. Default set to use CPU.")
     parser.add_argument('--c_rounds', type=int, default=300, help="number of federated rounds")
     parser.add_argument('--start_round', type=int, default=0, help="round to resume training from")
@@ -40,11 +44,11 @@ def args_parser():
                               "personalisation gain = dice_with_Rk - dice_without_Rk; roughly doubles eval cost")
     parser.add_argument('--eval_global_model', action='store_true',
                          help='additionally build a global model (global encoders + A0, R=0, shared decoder) and evaluate it '
-                              "on a held-out global test split and on every client's own test split")
+                              "on client validation splits, then on client/global held-out test splits only at the final round")
     parser.add_argument('--target_dice', nargs='+', type=float, default=[50, 55, 60, 65],
                          help='mean-Dice(%%) targets to report the first eval round each one is reached at')
     parser.add_argument('--global_test_size', type=int, default=50,
-                         help='number of held-out cases in the global test split (only used the first time it is created)')
+                         help='legacy split only: number of held-out global-test cases')
     parser.add_argument('--global_test_seed', type=int, default=42,
                          help='seed for the deterministic global test split selection')
     parser.add_argument('--voxel_spacing', nargs=3, type=float, default=[1.0, 1.0, 1.0],

@@ -44,8 +44,9 @@ class Brats_train(Dataset):
         with open(data_file_path, 'r') as f:
             datalist = [i.strip() for i in f.readlines()]
         datalist.sort()
-        random.seed(3)
-        random.shuffle(datalist)
+        # Keep the deterministic data order local to the dataset.  Mutating the
+        # process-wide RNG here would couple data construction to model/SD RNG.
+        random.Random(3).shuffle(datalist)
 
         if not all_:
             print(datalist)
@@ -116,8 +117,7 @@ class Brats_test(Dataset):
         with open(data_file_path, 'r') as f:
             datalist = [i.strip() for i in f.readlines()]
         datalist.sort()
-        random.seed(3)
-        random.shuffle(datalist)
+        random.Random(3).shuffle(datalist)
 
         if not all_:
             print(datalist)
@@ -183,8 +183,7 @@ class GLB_Brats_train(Dataset):
         datalist.sort()
 
         datalist.sort()
-        random.seed(3)
-        random.shuffle(datalist)
+        random.Random(3).shuffle(datalist)
         
         if not all_:
             datalist = datalist[:int(len(datalist) * 0.6 * partial)]

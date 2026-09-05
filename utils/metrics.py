@@ -435,8 +435,12 @@ class MetricsRecorder:
             dice_matrix = payload.get('dice_matrix')
             hd95_matrix = payload.get('hd95_matrix')
             gain_matrix = payload.get('personalisation_gain_matrix')
+            test_dice_matrix = payload.get('test_dice_matrix')
+            test_hd95_matrix = payload.get('test_hd95_matrix')
+            test_gain_matrix = payload.get('test_personalisation_gain_matrix')
             comm_per_client = payload.get('comm_per_client', {})
             global_minus_client = payload.get('global_minus_client', {})
+            test_global_minus_client = payload.get('test_global_minus_client', {})
             for c in range(self.client_num):
                 row = {'round': round_idx, 'client': c + 1}
                 if dice_matrix is not None:
@@ -448,6 +452,15 @@ class MetricsRecorder:
                 if gain_matrix is not None:
                     for i, r in enumerate(REGIONS):
                         row['pers_gain_' + r] = gain_matrix[c][i]
+                if test_dice_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['test_dice_' + r] = test_dice_matrix[c][i]
+                if test_hd95_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['test_hd95_' + r] = test_hd95_matrix[c][i]
+                if test_gain_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['test_pers_gain_' + r] = test_gain_matrix[c][i]
                 comm = comm_per_client.get(c) or comm_per_client.get(str(c))
                 if comm is not None:
                     row['uploaded_params'] = comm['uploaded']
@@ -456,6 +469,10 @@ class MetricsRecorder:
                 if gmc is not None:
                     for i, r in enumerate(REGIONS):
                         row['global_minus_client_' + r] = gmc[i]
+                test_gmc = test_global_minus_client.get(c) or test_global_minus_client.get(str(c))
+                if test_gmc is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['test_global_minus_client_' + r] = test_gmc[i]
                 rows.append(row)
         if not rows:
             return

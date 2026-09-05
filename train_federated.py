@@ -14,11 +14,12 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from dataset.data_utils import init_fn
 import copy
+import hashlib
+import json
 
 
 from models.fusion_net import FusionSegNet
 from utils.fl_utils import avg_EW
-from utils.lr_scheduler import LR_Scheduler
 from utils import criterions
 from dataset.datasets import Brats_test, Brats_train
 from dataset.global_split import build_global_test_split
@@ -61,6 +62,114 @@ def build_client_split_files(setting_options, dataname, client_num):
     return {i: os.path.abspath(os.path.join('split', subdir, 'c{}.csv'.format(i))) for i in range(1, client_num + 1)}
 
 
+def _read_case_ids(path):
+    with open(path, 'r') as handle:
+        return [line.strip() for line in handle if line.strip()]
+
+
+def load_materialized_split(config_path, client_num, data_seed):
+    """Load and defensively validate a materialized paired-split config."""
+    config_path = os.path.abspath(config_path)
+    with open(config_path, 'r') as handle:
+        config = json.load(handle)
+
+    if config.get('modality_order') != ['FLAIR', 'T1ce', 'T1', 'T2']:
+        raise ValueError('split config modality order must be [FLAIR, T1ce, T1, T2]')
+    if int(config.get('data_seed', -1)) != int(data_seed):
+        raise ValueError('split config data_seed does not match --data_seed')
+    if client_num != 8 or config.get('split_id') not in ('A', 'B'):
+        raise ValueError('paired Split A/B requires exactly 8 clients')
+
+    client_ids = ['C{}'.format(i) for i in range(1, client_num + 1)]
+    if sorted(config.get('clients', {})) != sorted(client_ids):
+        raise ValueError('split config client set does not match --client_num')
+    if sorted(config.get('masks', {})) != sorted(client_ids):
+        raise ValueError('split config mask set does not match --client_num')
+
+    masks = []
+    train_files, validation_files, test_files = {}, {}, {}
+    all_client_cases = set()
+    assignment_hasher = hashlib.sha256()
+    config_dir = os.path.dirname(config_path)
+
+    def resolve_path(value):
+        path = value if os.path.isabs(value) else os.path.join(config_dir, value)
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            raise ValueError('split file does not exist: {}'.format(path))
+        return path
+
+    for index, client_id in enumerate(client_ids, start=1):
+        mask = [bool(value) for value in config['masks'][client_id]]
+        if len(mask) != 4 or not any(mask):
+            raise ValueError('{} has an invalid/empty modality mask'.format(client_id))
+        masks.append(mask)
+
+        record = config['clients'][client_id]
+        client_cases = set()
+        for partition, destination in (
+                ('train', train_files), ('validation', validation_files), ('test', test_files)):
+            path = resolve_path(record['files'][partition])
+            case_ids = _read_case_ids(path)
+            expected = int(record['partition_counts'][partition])
+            if len(case_ids) != expected or len(case_ids) != len(set(case_ids)):
+                raise ValueError('{} {} count/uniqueness check failed'.format(client_id, partition))
+            overlap = client_cases.intersection(case_ids)
+            if overlap:
+                raise ValueError('{} partitions overlap: {}'.format(client_id, sorted(overlap)))
+            client_cases.update(case_ids)
+            destination[index] = path
+            assignment_hasher.update(
+                ('{}|{}|{}\n'.format(client_id, partition, '\n'.join(case_ids))).encode('utf-8'))
+
+        overlap = all_client_cases.intersection(client_cases)
+        if overlap:
+            raise ValueError('patients occur in multiple clients: {}'.format(sorted(overlap)))
+        all_client_cases.update(client_cases)
+
+    expected_split_a_masks = [
+        [True, True, True, True], [True, True, True, False],
+        [True, False, True, True], [True, False, True, False],
+        [True, False, False, True], [True, False, False, False],
+        [True, False, True, False], [False, False, False, True],
+    ]
+    expected_masks = expected_split_a_masks
+    if config['split_id'] == 'B':
+        expected_masks = [
+            [mask[1], mask[0], mask[2], mask[3]]
+            for mask in expected_split_a_masks]
+    if masks != expected_masks:
+        raise ValueError('Split {} masks do not match the registered design'.format(
+            config['split_id']))
+
+    actual_pools = {
+        name: sum(int(mask[m]) for mask in masks)
+        for m, name in enumerate(['FLAIR', 'T1ce', 'T1', 'T2'])
+    }
+    expected_pools = {name: int(value) for name, value in config['expected_modality_pool_sizes'].items()}
+    if actual_pools != expected_pools:
+        raise ValueError('modality pool sizes do not match materialized config')
+
+    global_test_file = resolve_path(config['global_test_file'])
+    global_cases = _read_case_ids(global_test_file)
+    if len(global_cases) != 50 or len(global_cases) != len(set(global_cases)):
+        raise ValueError('global held-out test must contain 50 unique cases')
+    overlap = all_client_cases.intersection(global_cases)
+    if overlap:
+        raise ValueError('global held-out test overlaps clients: {}'.format(sorted(overlap)))
+
+    metadata = {
+        'split_id': config['split_id'],
+        'data_seed': int(config['data_seed']),
+        'mapping_fingerprint': config['mapping_fingerprint'],
+        'patient_assignment_fingerprint': assignment_hasher.hexdigest(),
+        'modality_order': config['modality_order'],
+        'masks': masks,
+        'global_test_file': global_test_file,
+    }
+    return masks, train_files, validation_files, test_files, global_test_file, metadata
+
+
 def self_cuda(obj, device):
     if isinstance(obj, list):
         return [self_cuda(l, device) for l in obj]
@@ -79,15 +188,12 @@ def select_clients(round, state):
 def local_training(args, device, mask, dataloader, model, client_idx, round, optimizer):
     # set mode to train model
 
-    lr_schedule = LR_Scheduler(args.lr, args.c_rounds)
     model.train()
     model = model.to(device)
     start = time.time()
     epoch_loss = {'total':[], 'fuse':[], 'prm':[], 'sep':[], 'sd':[]}
     optim = optimizer.state_dict()
     optimizer.load_state_dict({k:self_cuda(optim[k], device) for k in optim})
-
-    step_lr = lr_schedule(optimizer, round)
 
     mask = mask.to(device)             # bool tensor, shape [4]
     n_present = int(mask.sum().item())
@@ -318,11 +424,27 @@ if __name__ == '__main__':
 
     writer = SummaryWriter(os.path.join(args.save_path, 'TBlog'))
 
-    ##### modality-availability presets and per-client split files
-    masks = resolve_modality_masks(args.setting_options)
-    args.train_file = build_client_split_files(args.setting_options, args.dataname, args.client_num)
+    ##### modality availability and per-client train/validation/test files
+    materialized_split = bool(args.split_config)
+    split_metadata = None
+    if materialized_split:
+        (masks, args.train_file, args.validation_file, args.test_file,
+         args.global_test_file, split_metadata) = load_materialized_split(
+            args.split_config, args.client_num, args.data_seed)
+        logging.info(
+            'Loaded materialized Split %s with data_seed=%d, assignment fingerprint=%s',
+            split_metadata['split_id'], split_metadata['data_seed'],
+            split_metadata['patient_assignment_fingerprint'])
+    else:
+        masks = resolve_modality_masks(args.setting_options)
+        args.train_file = build_client_split_files(
+            args.setting_options, args.dataname, args.client_num)
+        # Legacy CSVs use the dataset classes' historical internal 60/40 split.
+        args.validation_file = dict(args.train_file)
+        args.test_file = dict(args.train_file)
+        args.global_test_file = None
 
-    masks_torch = torch.from_numpy(np.array(masks))
+    masks_torch = torch.from_numpy(np.array(masks, dtype=np.bool_))
     logging.info(masks_torch.int())
 
     ########## setting seed for deterministic
@@ -344,7 +466,6 @@ if __name__ == '__main__':
     ########## setting model
     client_model = FusionSegNet(num_cls=args.num_class)
 
-    lr_schedule = LR_Scheduler(args.lr, args.c_rounds)
     ########## FL setting ##########
     # define dataset, model, optimizer for each clients
     dataloader_clients, validloader_clients, testloader_clients = [], [], []
@@ -355,14 +476,22 @@ if __name__ == '__main__':
 
     for client_idx in range(args.client_num):
         lc_train_file = args.train_file[client_idx+1]
+        lc_validation_file = args.validation_file[client_idx+1]
+        lc_test_file = args.test_file[client_idx+1]
         data_set = Brats_train(transforms=args.train_transforms, root=args.datapath,
-                                modal='all', num_cls=args.num_class, train_file=lc_train_file)
+                                modal='all', num_cls=args.num_class, train_file=lc_train_file,
+                                all_=materialized_split)
         data_loader = DataLoader(dataset=data_set, batch_size=args.batch_size,
                                 pin_memory=True, shuffle=True, worker_init_fn=init_fn)
         valid_set = Brats_test(transforms=args.test_transforms, root=args.datapath,
-                                modal='all', test_file=lc_train_file)
+                                modal='all', test_file=lc_validation_file,
+                                all_=materialized_split)
         valid_loader = DataLoader(dataset=valid_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
-        test_loader = valid_loader
+        test_set = Brats_test(transforms=args.test_transforms, root=args.datapath,
+                              modal='all', test_file=lc_test_file,
+                              all_=materialized_split)
+        test_loader = DataLoader(dataset=test_set, batch_size=1, shuffle=False,
+                                 num_workers=0, pin_memory=True)
 
         # Set Optimizer for the local model update
         net = copy.deepcopy(client_model)
@@ -376,7 +505,8 @@ if __name__ == '__main__':
         validloader_clients.append(valid_loader)
         testloader_clients.append(test_loader)
         logging.info('Client-{} : Brats dataset with modal {}'.format(client_idx+1, masks[client_idx]))
-        logging.info('the length of Brats dataset is {} : {}'.format(len(data_set), len(valid_set)))
+        logging.info('Client-{} cases: train={}, validation={}, test={}'.format(
+            client_idx + 1, len(data_set), len(valid_set), len(test_set)))
 
     best_dices = [0.0] * args.client_num
 
@@ -399,9 +529,13 @@ if __name__ == '__main__':
         metrics_recorder.try_resume()
     metrics_recorder.set_static('client_modalities', {c: masks[c] for c in range(args.client_num)})
     metrics_recorder.set_static('private_param_fraction', private_fraction_static)
+    if split_metadata is not None:
+        metrics_recorder.set_static('split', split_metadata)
     metrics_recorder.set_static('config', {
         'setting_options': args.setting_options, 'dataname': args.dataname, 'client_num': args.client_num,
         'c_rounds': args.c_rounds, 'eval': args.eval, 'seed': args.seed, 'target_dice': args.target_dice,
+        'split_config': os.path.abspath(args.split_config) if args.split_config else '',
+        'data_seed': args.data_seed,
         'voxel_spacing': list(voxel_spacing), 'compute_hd95': args.compute_hd95,
         'compute_pers_gain': args.compute_pers_gain, 'eval_global_model': args.eval_global_model,
         'global_test_size': args.global_test_size, 'global_test_seed': args.global_test_seed,
@@ -409,10 +543,13 @@ if __name__ == '__main__':
 
     global_test_loader = None
     if args.eval_global_model:
-        split_dir = os.path.dirname(next(iter(args.train_file.values())))
-        global_test_csv = build_global_test_split(
-            datapath=args.datapath, client_split_files=args.train_file, out_dir=split_dir,
-            num_cases=args.global_test_size, seed=args.global_test_seed)
+        if materialized_split:
+            global_test_csv = args.global_test_file
+        else:
+            split_dir = os.path.dirname(next(iter(args.train_file.values())))
+            global_test_csv = build_global_test_split(
+                datapath=args.datapath, client_split_files=args.train_file, out_dir=split_dir,
+                num_cases=args.global_test_size, seed=args.global_test_seed)
         global_test_set = Brats_test(transforms=args.test_transforms, root=args.datapath,
                                       modal='all', test_file=global_test_csv, all_=True)
         global_test_loader = DataLoader(dataset=global_test_set, batch_size=1, shuffle=False,
@@ -432,7 +569,19 @@ if __name__ == '__main__':
 
     if args.resume != 0:
 
-        ckpt = torch.load(args.modelfile_path + '/last.pth')
+        ckpt = torch.load(args.modelfile_path + '/last.pth', map_location='cpu')
+
+        if split_metadata is not None:
+            saved_split = ckpt.get('split_metadata')
+            if saved_split is None:
+                raise ValueError('refusing to resume: checkpoint has no split metadata')
+            identity_keys = (
+                'split_id', 'data_seed', 'mapping_fingerprint',
+                'patient_assignment_fingerprint', 'masks')
+            for key in identity_keys:
+                if saved_split.get(key) != split_metadata.get(key):
+                    raise ValueError(
+                        'refusing to resume: checkpoint split mismatch for {}'.format(key))
 
         for client_i in range(args.client_num):
             model_clients[client_i].load_state_dict(ckpt["clients_dict"][client_i])
@@ -447,8 +596,16 @@ if __name__ == '__main__':
         print("load best result: {}".format(best_dices))
 
     ########## FL Training ##########
-    for round in tqdm(range(args.start_round, args.c_rounds+1)):
+    if args.start_round > args.c_rounds:
+        raise ValueError('checkpoint round exceeds --c_rounds')
+
+    # c_rounds is a count: a fresh 2-round smoke test executes rounds 0 and 1,
+    # then stores completed round 2.  On resume, ckpt['round'] is the next index.
+    for round in tqdm(range(args.start_round, args.c_rounds)):
         start = time.time()
+        completed_round = round + 1
+        is_final_round = completed_round == args.c_rounds
+        should_evaluate = (completed_round % args.eval == 0) or is_final_round
 
         active_clients = select_clients(round, agg_state)
         logging.info('\n | Federated Round : {} | active clients: {} |'.format(round, [c+1 for c in active_clients]))
@@ -514,8 +671,8 @@ if __name__ == '__main__':
             metrics_recorder.comm.record_download(client_i, round, global_encoders, global_decoder_prior)
 
         ##### Eval the model after aggregation and every args.eval rounds
-        if (round+1)%args.eval==0:
-            logging.info('-'*20 + 'Test All the Models per 10 round'+ '-'*20)
+        if should_evaluate:
+            logging.info('-'*20 + 'Validate all client models'+ '-'*20)
             with torch.no_grad():
                 results = []
                 dice_matrix = [None] * args.client_num
@@ -545,7 +702,7 @@ if __name__ == '__main__':
                     dice_matrix[c] = dice_score
                     c_model = model_clients[c]
                     avgdice_score = sum(dice_score)/len(dice_score)
-                    logging.info('--- Eval at round_{}, Avg_Scores: {:.4f}, cls_Dice: {}'
+                    logging.info('--- Validation at round_{}, Avg_Scores: {:.4f}, cls_Dice: {}'
                                                         .format((round), avgdice_score*100, dice_score))
                     writer.add_scalar('Eval_AvgDice/client_'+str(c+1), avgdice_score*100, round)
 
@@ -555,12 +712,15 @@ if __name__ == '__main__':
                             'round': round+1,
                             'dice': dice_score,
                             'state_dict': c_model.state_dict(),
+                            'split_metadata': split_metadata,
                         }, args.modelfile_path + '/client-%d_round_%d_model_best.pth'%(c+1, round))
 
                 ##### structured metrics.json/.csv -- additive only, never feeds back into
                 ##### training/aggregation/best_dices/checkpointing above.
                 round_payload = {
                     'dice_matrix': [list(map(float, dice_matrix[c])) for c in range(args.client_num)],
+                    'validation_dice_matrix': [list(map(float, dice_matrix[c])) for c in range(args.client_num)],
+                    'evaluation_partition': 'validation',
                     'comm_per_client': metrics_recorder.comm.round_totals(round),
                 }
 
@@ -572,6 +732,26 @@ if __name__ == '__main__':
                         round, variation['mean_dice_std'], variation['mean_dice_range'],
                         variation['best_client'] + 1, variation['best_client_mean_dice'],
                         variation['worst_client'] + 1, variation['worst_client_mean_dice']))
+
+                # Client test sets are never used for checkpoint selection or
+                # tuning.  They are evaluated once, after the final round, only
+                # to produce the reported result.
+                test_dice_matrix = None
+                if is_final_round:
+                    test_results = fedmetrics.run_pooled(
+                        args, list(range(args.client_num)), local_test,
+                        lambda c: (args, testloader_clients[c], model_clients[c],
+                                   args.local_devices[c], 'BRATS2020', {}, masks[c]))
+                    test_dice_matrix = [test_results[c] for c in range(args.client_num)]
+                    round_payload['test_dice_matrix'] = [
+                        list(map(float, test_dice_matrix[c])) for c in range(args.client_num)]
+                    round_payload['test_client_variation'] = fedmetrics.client_dice_variation(
+                        test_dice_matrix)
+                    for c in range(args.client_num):
+                        logging.info(
+                            '--- FINAL TEST at round_{}, client_{}, Avg_Scores: {:.4f}, cls_Dice: {}'.format(
+                                round, c + 1, float(np.mean(test_dice_matrix[c])) * 100.0,
+                                test_dice_matrix[c]))
 
                 if args.compute_hd95:
                     hd95_results = fedmetrics.run_pooled(
@@ -585,6 +765,18 @@ if __name__ == '__main__':
                         logging.info('--- Eval at round_{}, client_{} HD95(mm): {} | edge cases: {}'.format(
                             round, c + 1, hd95_results[c]['hd95'], hd95_results[c]['edge_counts']))
 
+                    if is_final_round:
+                        test_hd95_results = fedmetrics.run_pooled(
+                            args, list(range(args.client_num)), fedmetrics.evaluate_client,
+                            lambda c: (args, testloader_clients[c], model_clients[c],
+                                       args.local_devices[c], masks[c], True, voxel_spacing))
+                        round_payload['test_hd95_matrix'] = [
+                            list(map(float, test_hd95_results[c]['hd95']))
+                            for c in range(args.client_num)]
+                        round_payload['test_hd95_edge_counts'] = {
+                            c: test_hd95_results[c]['edge_counts']
+                            for c in range(args.client_num)}
+
                 if args.compute_pers_gain:
                     zero_models = {c: fedmetrics.zero_residual_copy(model_clients[c]) for c in range(args.client_num)}
                     pers_results = fedmetrics.run_pooled(
@@ -597,6 +789,20 @@ if __name__ == '__main__':
                         logging.info('--- Eval at round_{}, client_{} personalisation gain (with R_k - without R_k): {}'.format(
                             round, c + 1, gain_matrix[c]))
 
+                    if is_final_round:
+                        test_zero_models = {
+                            c: fedmetrics.zero_residual_copy(model_clients[c])
+                            for c in range(args.client_num)}
+                        test_pers_results = fedmetrics.run_pooled(
+                            args, list(range(args.client_num)), fedmetrics.evaluate_client,
+                            lambda c: (args, testloader_clients[c], test_zero_models[c],
+                                       args.local_devices[c], masks[c], False, voxel_spacing))
+                        test_gain_matrix = [
+                            test_dice_matrix[c] - test_pers_results[c]['dice']
+                            for c in range(args.client_num)]
+                        round_payload['test_personalisation_gain_matrix'] = [
+                            list(map(float, value)) for value in test_gain_matrix]
+
                 if args.eval_global_model:
                     global_model = FusionSegNet(num_cls=args.num_class)
                     global_model.flair_encoder.load_state_dict(global_encoders[0])
@@ -604,6 +810,10 @@ if __name__ == '__main__':
                     global_model.t1_encoder.load_state_dict(global_encoders[2])
                     global_model.t2_encoder.load_state_dict(global_encoders[3])
                     global_model.fusion_decoder.load_state_dict(global_decoder_prior, strict=False)
+                    with torch.no_grad():
+                        for name, parameter in global_model.named_parameters():
+                            if name.endswith('_residual'):
+                                parameter.zero_()
 
                     # dispatch the per-client pooled eval first, while global_model is
                     # still CPU-resident -- each spawned worker pickles its own copy,
@@ -617,30 +827,45 @@ if __name__ == '__main__':
                     }
                     round_payload['global_minus_client'] = {
                         c: list(map(float, global_minus_client[c])) for c in range(args.client_num)}
+                    round_payload['global_minus_client_partition'] = 'validation'
                     for c in range(args.client_num):
                         logging.info('--- Eval at round_{}, client_{} global_minus_client (own modalities): {}'.format(
                             round, c + 1, global_minus_client[c]))
 
-                    # runs in-process (not pooled), so it's fine that evaluate_client
-                    # moves global_model onto args.device in place -- nothing reuses
-                    # this object afterwards.
-                    global_test_result = fedmetrics.evaluate_client(
-                        args, global_test_loader, global_model, args.device,
-                        [True, True, True, True], True, voxel_spacing)
-                    round_payload['global_model'] = {
-                        'dice': list(map(float, global_test_result['dice'])),
-                        'hd95': list(map(float, global_test_result['hd95'])),
-                        'edge_counts': global_test_result['edge_counts'],
-                        'n_cases': global_test_result['n_cases'],
-                    }
-                    logging.info('--- Eval at round_{}, GLOBAL model on held-out global test set: Dice={} HD95(mm)={}'.format(
-                        round, global_test_result['dice'], global_test_result['hd95']))
+                    if is_final_round:
+                        global_on_test_results = fedmetrics.run_pooled(
+                            args, list(range(args.client_num)), fedmetrics.evaluate_client,
+                            lambda c: (args, testloader_clients[c], global_model,
+                                       args.local_devices[c], masks[c], False, voxel_spacing))
+                        test_global_minus_client = {
+                            c: (global_on_test_results[c]['dice'] - test_dice_matrix[c])
+                            for c in range(args.client_num)}
+                        round_payload['test_global_minus_client'] = {
+                            c: list(map(float, test_global_minus_client[c]))
+                            for c in range(args.client_num)}
+
+                        # This is the only access to the shared held-out test set.
+                        # It runs in-process after all pooled evaluations are done.
+                        global_test_result = fedmetrics.evaluate_client(
+                            args, global_test_loader, global_model, args.device,
+                            [True, True, True, True], True, voxel_spacing)
+                        round_payload['global_model'] = {
+                            'dice': list(map(float, global_test_result['dice'])),
+                            'hd95': list(map(float, global_test_result['hd95'])),
+                            'edge_counts': global_test_result['edge_counts'],
+                            'n_cases': global_test_result['n_cases'],
+                            'partition': 'global_held_out_test',
+                            'private_residual_zeroed': True,
+                        }
+                        logging.info(
+                            '--- FINAL GLOBAL TEST at round_{}, Dice={} HD95(mm)={}'.format(
+                                round, global_test_result['dice'], global_test_result['hd95']))
 
                 metrics_recorder.record_round(round, round_payload)
                 metrics_recorder.flush()
 
         logging.info('*'*10+'FL train a round total time: {:.4f} hours'.format((time.time() - start)/3600)+'*'*10)
-        if (round+1)%args.eval == 0:
+        if should_evaluate:
             torch.save({
 
             'round': round + 1,
@@ -653,6 +878,7 @@ if __name__ == '__main__':
             'agg_state': agg_state,
 
             'best_dices': best_dices,
+            'split_metadata': split_metadata,
             }, args.modelfile_path + '/last.pth')
 
     writer.close()
