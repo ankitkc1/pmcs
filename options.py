@@ -23,7 +23,7 @@ def args_parser():
     parser.add_argument('--data_seed', default=20260905, type=int,
                         help='patient-assignment seed, deliberately independent of --seed')
     parser.add_argument('--gpus', default='1,2,3,4', help="To use cuda, set to a specific GPU ID. Default set to use CPU.")
-    parser.add_argument('--c_rounds', type=int, default=300, help="number of federated rounds")
+    parser.add_argument('--c_rounds', type=int, default=250, help="number of federated rounds")
     parser.add_argument('--start_round', type=int, default=0, help="round to resume training from")
     parser.add_argument('--local_ep', type=int, default=1, help="number of local epochs per round")
     parser.add_argument('--client_num', type=int, default=4, help="number of federated clients")
@@ -53,6 +53,12 @@ def args_parser():
                          help='seed for the deterministic global test split selection')
     parser.add_argument('--voxel_spacing', nargs=3, type=float, default=[1.0, 1.0, 1.0],
                          help='voxel spacing in mm (H, W, D) of the preprocessed volumes, used for HD95')
+    parser.add_argument('--postproc', default='largest_cc', choices=['none', 'largest_cc', 'min_volume'],
+                         help='post-processing applied to each predicted binary region mask (WT/TC/ET) before '
+                              'Dice/HD95, in addition to (never replacing) the raw un-post-processed numbers; '
+                              'only takes effect where --compute_hd95 is also set')
+    parser.add_argument('--min_component_voxels', type=int, default=50,
+                         help='--postproc min_volume: drop connected components smaller than this many voxels')
 
     args = parser.parse_args()
     return args

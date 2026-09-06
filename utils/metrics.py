@@ -15,12 +15,13 @@ import os
 
 import numpy as np
 import torch
+from scipy import ndimage
 
 from utils.predict import softmax_output_dice_class4
 
 REGIONS = ('WT', 'TC', 'ET')
 HD95_BOTH_EMPTY = 0.0
-HD95_MISMATCH_EMPTY = 373.13
+POSTPROC_CHOICES = ('none', 'largest_cc', 'min_volume')
 
 
 # HD95
@@ -38,40 +39,124 @@ def _region_masks(label_map):
     }
 
 
+def _hd95_from_masks(p, g, spacing, mismatch_empty_penalty):
+    """Shared edge-case handling for a single (prediction, reference) binary
+    mask pair: both empty -> 0, exactly one empty -> mismatch_empty_penalty,
+    otherwise the real medpy HD95."""
+    from medpy.metric.binary import hd95 as medpy_hd95
+
+    p_empty, g_empty = not p.any(), not g.any()
+    if p_empty and g_empty:
+        return HD95_BOTH_EMPTY, 'both_empty'
+    if p_empty or g_empty:
+        return mismatch_empty_penalty, 'mismatch_empty'
+    return float(medpy_hd95(p, g, voxelspacing=spacing)), 'normal'
+
+
+def _mismatch_empty_penalty(shape, spacing):
+    # BraTS-style failure penalty: the physical image diagonal.  For the
+    # canonical 240x240x155, 1-mm data this is 373.128664 mm (formerly a
+    # hard-coded 373.13); deriving it keeps other spacings/shapes correct.
+    return float(np.linalg.norm(np.asarray(shape, dtype=np.float64) * spacing))
+
+
 def hd95_case(pred_label, gt_label, spacing=(1.0, 1.0, 1.0)):
     """
     Per-case, per-region 95th-percentile Hausdorff distance in mm, using the
     BraTS edge-case convention: both empty -> 0, exactly one empty -> 373.13.
     Returns (values, tags) dicts keyed by region name.
     """
-    from medpy.metric.binary import hd95 as medpy_hd95
+    pred_label = np.asarray(pred_label)
+    gt_label = np.asarray(gt_label)
+    spacing = np.asarray(spacing, dtype=np.float64)
+    if pred_label.shape != gt_label.shape or pred_label.ndim != 3:
+        raise ValueError('HD95 requires matching 3-D prediction/reference shapes')
+    if spacing.shape != (3,) or not np.all(np.isfinite(spacing)) or np.any(spacing <= 0):
+        raise ValueError('HD95 spacing must contain three positive finite values')
+
+    mismatch_empty_penalty = _mismatch_empty_penalty(pred_label.shape, spacing)
 
     pred_masks = _region_masks(pred_label)
     gt_masks = _region_masks(gt_label)
 
     values, tags = {}, {}
     for region in REGIONS:
-        p, g = pred_masks[region], gt_masks[region]
-        p_empty, g_empty = not p.any(), not g.any()
-        if p_empty and g_empty:
-            values[region] = HD95_BOTH_EMPTY
-            tags[region] = 'both_empty'
-        elif p_empty or g_empty:
-            values[region] = HD95_MISMATCH_EMPTY
-            tags[region] = 'mismatch_empty'
-        else:
-            values[region] = float(medpy_hd95(p, g, voxelspacing=spacing))
-            tags[region] = 'normal'
+        values[region], tags[region] = _hd95_from_masks(
+            pred_masks[region], gt_masks[region], spacing, mismatch_empty_penalty)
     return values, tags
+
+
+# Post-processing (applied to a predicted binary region mask, before Dice/HD95)
+
+def apply_postproc(mask, method, min_component_voxels=50):
+    """mask: bool ndarray. `method` in POSTPROC_CHOICES.
+    largest_cc: keep only the largest connected component.
+    min_volume: drop components smaller than `min_component_voxels`.
+    Ground truth is never post-processed -- this is prediction-only clean-up."""
+    if method not in POSTPROC_CHOICES:
+        raise ValueError('unknown postproc method: {!r}'.format(method))
+    if method == 'none' or not mask.any():
+        return mask
+
+    labeled, num_components = ndimage.label(mask)
+    if num_components <= 1:
+        return mask
+    sizes = ndimage.sum(mask, labeled, index=np.arange(1, num_components + 1))
+
+    if method == 'largest_cc':
+        keep_labels = [int(np.argmax(sizes)) + 1]
+    else:  # min_volume
+        keep_labels = [i + 1 for i, size in enumerate(sizes) if size >= min_component_voxels]
+
+    if not keep_labels:
+        return np.zeros_like(mask, dtype=bool)
+    return np.isin(labeled, keep_labels)
+
+
+def _binary_dice(p_mask, g_mask, eps=1e-8):
+    p = p_mask.astype(np.float64)
+    g = g_mask.astype(np.float64)
+    intersect = 2.0 * float(np.sum(p * g)) + eps
+    denom = float(np.sum(p)) + float(np.sum(g)) + eps
+    return intersect / denom
+
+
+def postproc_case_metrics(pred_label, gt_label, spacing, method, min_component_voxels=50):
+    """Apply `method` to each predicted region mask (WT, TC, ET) independently,
+    then compute Dice and HD95 against the (unmodified) ground-truth region
+    mask. Returns (dice_values, hd95_values, hd95_tags) dicts keyed by region."""
+    pred_label = np.asarray(pred_label)
+    gt_label = np.asarray(gt_label)
+    spacing = np.asarray(spacing, dtype=np.float64)
+    mismatch_empty_penalty = _mismatch_empty_penalty(pred_label.shape, spacing)
+
+    pred_masks = _region_masks(pred_label)
+    gt_masks = _region_masks(gt_label)
+
+    dice_values, hd95_values, hd95_tags = {}, {}, {}
+    for region in REGIONS:
+        p_post = apply_postproc(pred_masks[region], method, min_component_voxels)
+        g = gt_masks[region]
+        dice_values[region] = _binary_dice(p_post, g)
+        hd95_values[region], hd95_tags[region] = _hd95_from_masks(
+            p_post, g, spacing, mismatch_empty_penalty)
+    return dice_values, hd95_values, hd95_tags
 
 
 # Sliding-window evaluator with optional HD95 on top.
 
-def evaluate_client(args, test_loader, model, device, modal_mask, compute_hd95=False, spacing=(1.0, 1.0, 1.0)):
+def evaluate_client(args, test_loader, model, device, modal_mask, compute_hd95=False, spacing=(1.0, 1.0, 1.0),
+                     postproc='none', min_component_voxels=50):
     """
     Sliding-window inference identical to utils.predict.local_test (same
     patch_size=80, same overlap/weighting), reusing softmax_output_dice_class4
     for Dice so results agree with the existing eval path.
+
+    When compute_hd95 is set, every Dice/HD95 number is additionally computed
+    a second time after applying `postproc` (see apply_postproc) to each
+    predicted region mask (WT, TC, ET); both the raw and post-processed
+    numbers are returned so their effect can be quantified directly, and the
+    raw numbers stay bit-identical to runs made before --postproc existed.
     """
     model = model.to(device)
     H, W, T = 240, 240, 155
@@ -81,7 +166,12 @@ def evaluate_client(args, test_loader, model, device, modal_mask, compute_hd95=F
 
     dice_sum = np.zeros(3, dtype=np.float64)
     hd95_sum = np.zeros(3, dtype=np.float64)
+    hd95_valid_pair_sum = np.zeros(3, dtype=np.float64)
     edge_counts = {r: {'both_empty': 0, 'mismatch_empty': 0, 'normal': 0} for r in REGIONS}
+    dice_postproc_sum = np.zeros(3, dtype=np.float64)
+    hd95_postproc_sum = np.zeros(3, dtype=np.float64)
+    hd95_postproc_valid_pair_sum = np.zeros(3, dtype=np.float64)
+    postproc_edge_counts = {r: {'both_empty': 0, 'mismatch_empty': 0, 'normal': 0} for r in REGIONS}
     n_cases = 0
 
     mask_t = torch.from_numpy(np.array(modal_mask)).unsqueeze(0).to(device)
@@ -132,12 +222,47 @@ def evaluate_client(args, test_loader, model, device, modal_mask, compute_hd95=F
                     for ri, region in enumerate(REGIONS):
                         hd95_sum[ri] += values[region]
                         edge_counts[region][tags[region]] += 1
+                        if tags[region] == 'normal':
+                            hd95_valid_pair_sum[ri] += values[region]
 
-    n_cases = max(n_cases, 1)
+                    dice_pp, hd95_pp, tags_pp = postproc_case_metrics(
+                        pred_np[k], target_np[k], spacing, postproc, min_component_voxels)
+                    for ri, region in enumerate(REGIONS):
+                        dice_postproc_sum[ri] += dice_pp[region]
+                        hd95_postproc_sum[ri] += hd95_pp[region]
+                        postproc_edge_counts[region][tags_pp[region]] += 1
+                        if tags_pp[region] == 'normal':
+                            hd95_postproc_valid_pair_sum[ri] += hd95_pp[region]
+
+    if n_cases == 0:
+        raise ValueError('evaluation loader contains zero cases')
     result = {'dice': dice_sum / n_cases, 'n_cases': n_cases}
     if compute_hd95:
         result['hd95'] = hd95_sum / n_cases
         result['edge_counts'] = edge_counts
+        result['hd95_valid_pairs_only'] = [
+            (float(hd95_valid_pair_sum[i]) / edge_counts[region]['normal'])
+            if edge_counts[region]['normal'] else None
+            for i, region in enumerate(REGIONS)
+        ]
+        result['hd95_policy'] = {
+            'implementation': 'medpy.metric.binary.hd95',
+            'spacing_mm': [float(value) for value in spacing],
+            'both_empty': 0.0,
+            'mismatch_empty': 'physical_image_diagonal',
+        }
+        result['dice_postproc'] = dice_postproc_sum / n_cases
+        result['hd95_postproc'] = hd95_postproc_sum / n_cases
+        result['postproc_edge_counts'] = postproc_edge_counts
+        result['hd95_postproc_valid_pairs_only'] = [
+            (float(hd95_postproc_valid_pair_sum[i]) / postproc_edge_counts[region]['normal'])
+            if postproc_edge_counts[region]['normal'] else None
+            for i, region in enumerate(REGIONS)
+        ]
+        result['postproc_policy'] = {
+            'method': postproc,
+            'min_component_voxels': min_component_voxels,
+        }
     return result
 
 
@@ -185,6 +310,9 @@ class CommTracker:
         self.client_num = client_num
         self.uploaded = {c: {} for c in range(client_num)}
         self.downloaded = {c: {} for c in range(client_num)}
+        # Transient, in-memory only (not part of state_dict/resume): the set of
+        # tensor identities moved this round, used to assert download == upload.
+        self._uploaded_keys = {c: {} for c in range(client_num)}
 
     def record_upload(self, client_idx, round_idx, encoders, decoder_state, mask):
         """
@@ -192,29 +320,54 @@ class CommTracker:
         holds , plus the decoder's shared prior (A0) -- never the private residual (R_k).
         """
         numel = 0
+        keys = set()
         for m in range(4):
             if bool(mask[m]):
-                numel += sum(t.numel() for t in encoders[m].values())
+                for k, t in encoders[m].items():
+                    numel += t.numel()
+                    keys.add(('encoder', m, k))
         counted_keys = []
         for k, t in decoder_state.items():
             if k.endswith('_residual'):
                 continue
             counted_keys.append(k)
             numel += t.numel()
+            keys.add(('decoder', k))
         assert not any(k.endswith('_residual') for k in counted_keys), \
             'R_k (fusion adapter residual) must never be counted as uploaded'
         self.uploaded[client_idx][round_idx] = int(numel)
+        self._uploaded_keys[client_idx][round_idx] = keys
         return int(numel)
 
-    def record_download(self, client_idx, round_idx, global_encoders, global_decoder_prior):
-        """What broadcast_weights actually writes into this client: all 4
-        global encoders + the decoder
-        prior. Never the residual -- global_decoder_prior has no such keys."""
-        numel = sum(t.numel() for enc in global_encoders for t in enc.values())
+    def record_download(self, client_idx, round_idx, global_encoders, global_decoder_prior, mask):
+        """What broadcast_weights actually writes into this client: only the
+        global encoders for modalities this client's mask holds, plus the
+        decoder prior. Never the residual -- global_decoder_prior has no such
+        keys. Asserts the downloaded tensor identities match what this same
+        client uploaded this round, so the two are never allowed to drift
+        apart (e.g. a client downloading encoders it doesn't hold)."""
+        numel = 0
+        keys = set()
+        for m in range(4):
+            if bool(mask[m]):
+                for k, t in global_encoders[m].items():
+                    numel += t.numel()
+                    keys.add(('encoder', m, k))
         counted_keys = list(global_decoder_prior.keys())
         assert not any(k.endswith('_residual') for k in counted_keys), \
             'R_k (fusion adapter residual) must never be counted as downloaded'
-        numel += sum(t.numel() for t in global_decoder_prior.values())
+        for k, t in global_decoder_prior.items():
+            numel += t.numel()
+            keys.add(('decoder', k))
+
+        uploaded_keys = self._uploaded_keys[client_idx].get(round_idx)
+        if uploaded_keys is not None:
+            assert keys == uploaded_keys, (
+                'client {} round {}: downloaded tensor keys != uploaded tensor keys '
+                '(download-only: {}, upload-only: {})'.format(
+                    client_idx, round_idx,
+                    sorted(keys - uploaded_keys), sorted(uploaded_keys - keys)))
+
         self.downloaded[client_idx][round_idx] = int(numel)
         return int(numel)
 
@@ -374,10 +527,15 @@ class MetricsRecorder:
         self.comm = CommTracker(client_num)
         self.rounds = {}
         self.static = {}
-        self.target_tracker = None
+        # Separate trackers: validation Dice is evaluated every --eval rounds,
+        # test Dice only once at the final round, so "rounds-to-target" means
+        # something different for each and must never be silently conflated.
+        self.target_tracker_validation = None
+        self.target_tracker_test = None
 
     def init_target_tracker(self, targets):
-        self.target_tracker = TargetDiceTracker(targets, self.client_num)
+        self.target_tracker_validation = TargetDiceTracker(targets, self.client_num)
+        self.target_tracker_test = TargetDiceTracker(targets, self.client_num)
 
     def try_resume(self):
         if not os.path.exists(self.json_path):
@@ -388,30 +546,44 @@ class MetricsRecorder:
         self.rounds = {int(k): v for k, v in data.get('rounds', {}).items()}
         if 'comm_state' in data:
             self.comm.load_state_dict(data['comm_state'])
-        saved_targets = data.get('rounds_to_target_dice')
-        if self.target_tracker is not None and saved_targets:
-            self.target_tracker.targets = saved_targets['targets']
-            self.target_tracker.mean_hit_round = saved_targets['mean']
-            self.target_tracker.per_client_hit_round = {
-                int(k): v for k, v in saved_targets['per_client'].items()}
-            self.target_tracker.per_region_hit_round = saved_targets['per_region']
+
+        def _restore(tracker, saved):
+            if tracker is None or not saved:
+                return
+            tracker.targets = saved['targets']
+            tracker.mean_hit_round = saved['mean']
+            tracker.per_client_hit_round = {int(k): v for k, v in saved['per_client'].items()}
+            tracker.per_region_hit_round = saved['per_region']
+
+        saved_targets = data.get('rounds_to_target_dice') or {}
+        _restore(self.target_tracker_validation, saved_targets.get('validation'))
+        _restore(self.target_tracker_test, saved_targets.get('test'))
 
     def set_static(self, key, value):
         self.static[key] = value
 
     def record_round(self, round_idx, payload):
         self.rounds.setdefault(round_idx, {}).update(payload)
-        if self.target_tracker is not None and 'dice_matrix' in payload:
-            self.target_tracker.update(round_idx, payload['dice_matrix'])
+        if self.target_tracker_validation is not None and 'validation_dice_matrix' in payload:
+            self.target_tracker_validation.update(round_idx, payload['validation_dice_matrix'])
+        if self.target_tracker_test is not None and 'test_dice_matrix' in payload:
+            self.target_tracker_test.update(round_idx, payload['test_dice_matrix'])
 
-    def _rounds_to_target_summary(self):
-        if self.target_tracker is None:
+    @staticmethod
+    def _tracker_summary(tracker):
+        if tracker is None:
             return None
         return {
-            'targets': self.target_tracker.targets,
-            'mean': self.target_tracker.mean_hit_round,
-            'per_client': self.target_tracker.per_client_hit_round,
-            'per_region': self.target_tracker.per_region_hit_round,
+            'targets': tracker.targets,
+            'mean': tracker.mean_hit_round,
+            'per_client': tracker.per_client_hit_round,
+            'per_region': tracker.per_region_hit_round,
+        }
+
+    def _rounds_to_target_summary(self):
+        return {
+            'validation': self._tracker_summary(self.target_tracker_validation),
+            'test': self._tracker_summary(self.target_tracker_test),
         }
 
     def flush(self):
@@ -434,13 +606,23 @@ class MetricsRecorder:
             payload = self.rounds[round_idx]
             dice_matrix = payload.get('dice_matrix')
             hd95_matrix = payload.get('hd95_matrix')
+            hd95_valid_matrix = payload.get('hd95_valid_pairs_only_matrix')
+            dice_postproc_matrix = payload.get('dice_postproc_matrix')
+            hd95_postproc_matrix = payload.get('hd95_postproc_matrix')
+            hd95_postproc_valid_matrix = payload.get('hd95_postproc_valid_pairs_only_matrix')
             gain_matrix = payload.get('personalisation_gain_matrix')
             test_dice_matrix = payload.get('test_dice_matrix')
             test_hd95_matrix = payload.get('test_hd95_matrix')
+            test_hd95_valid_matrix = payload.get('test_hd95_valid_pairs_only_matrix')
+            test_dice_postproc_matrix = payload.get('test_dice_postproc_matrix')
+            test_hd95_postproc_matrix = payload.get('test_hd95_postproc_matrix')
+            test_hd95_postproc_valid_matrix = payload.get('test_hd95_postproc_valid_pairs_only_matrix')
             test_gain_matrix = payload.get('test_personalisation_gain_matrix')
             comm_per_client = payload.get('comm_per_client', {})
-            global_minus_client = payload.get('global_minus_client', {})
-            test_global_minus_client = payload.get('test_global_minus_client', {})
+            client_ceiling = payload.get('client_ceiling', {})
+            modality_deficit = payload.get('modality_deficit', {})
+            test_client_ceiling = payload.get('test_client_ceiling', {})
+            test_modality_deficit = payload.get('test_modality_deficit', {})
             for c in range(self.client_num):
                 row = {'round': round_idx, 'client': c + 1}
                 if dice_matrix is not None:
@@ -449,6 +631,18 @@ class MetricsRecorder:
                 if hd95_matrix is not None:
                     for i, r in enumerate(REGIONS):
                         row['hd95_' + r] = hd95_matrix[c][i]
+                if hd95_valid_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['hd95_valid_pairs_only_' + r] = hd95_valid_matrix[c][i]
+                if dice_postproc_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['dice_postproc_' + r] = dice_postproc_matrix[c][i]
+                if hd95_postproc_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['hd95_postproc_' + r] = hd95_postproc_matrix[c][i]
+                if hd95_postproc_valid_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['hd95_postproc_valid_pairs_only_' + r] = hd95_postproc_valid_matrix[c][i]
                 if gain_matrix is not None:
                     for i, r in enumerate(REGIONS):
                         row['pers_gain_' + r] = gain_matrix[c][i]
@@ -458,6 +652,18 @@ class MetricsRecorder:
                 if test_hd95_matrix is not None:
                     for i, r in enumerate(REGIONS):
                         row['test_hd95_' + r] = test_hd95_matrix[c][i]
+                if test_hd95_valid_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['test_hd95_valid_pairs_only_' + r] = test_hd95_valid_matrix[c][i]
+                if test_dice_postproc_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['test_dice_postproc_' + r] = test_dice_postproc_matrix[c][i]
+                if test_hd95_postproc_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['test_hd95_postproc_' + r] = test_hd95_postproc_matrix[c][i]
+                if test_hd95_postproc_valid_matrix is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['test_hd95_postproc_valid_pairs_only_' + r] = test_hd95_postproc_valid_matrix[c][i]
                 if test_gain_matrix is not None:
                     for i, r in enumerate(REGIONS):
                         row['test_pers_gain_' + r] = test_gain_matrix[c][i]
@@ -465,14 +671,22 @@ class MetricsRecorder:
                 if comm is not None:
                     row['uploaded_params'] = comm['uploaded']
                     row['downloaded_params'] = comm['downloaded']
-                gmc = global_minus_client.get(c) or global_minus_client.get(str(c))
-                if gmc is not None:
+                ceiling = client_ceiling.get(c) or client_ceiling.get(str(c))
+                if ceiling is not None:
                     for i, r in enumerate(REGIONS):
-                        row['global_minus_client_' + r] = gmc[i]
-                test_gmc = test_global_minus_client.get(c) or test_global_minus_client.get(str(c))
-                if test_gmc is not None:
+                        row['client_ceiling_' + r] = ceiling[i]
+                deficit = modality_deficit.get(c) or modality_deficit.get(str(c))
+                if deficit is not None:
                     for i, r in enumerate(REGIONS):
-                        row['test_global_minus_client_' + r] = test_gmc[i]
+                        row['modality_deficit_' + r] = deficit[i]
+                test_ceiling = test_client_ceiling.get(c) or test_client_ceiling.get(str(c))
+                if test_ceiling is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['test_client_ceiling_' + r] = test_ceiling[i]
+                test_deficit = test_modality_deficit.get(c) or test_modality_deficit.get(str(c))
+                if test_deficit is not None:
+                    for i, r in enumerate(REGIONS):
+                        row['test_modality_deficit_' + r] = test_deficit[i]
                 rows.append(row)
         if not rows:
             return

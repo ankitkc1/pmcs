@@ -369,14 +369,19 @@ def aggregate_decoder(local_decoders, active_clients):
     return avg_state
 
 
-def broadcast_weights(model_clients, global_encoders, global_decoder_prior):
-    for m in model_clients:
-        m.flair_encoder.load_state_dict(global_encoders[0])
-        m.t1ce_encoder.load_state_dict(global_encoders[1])
-        m.t1_encoder.load_state_dict(global_encoders[2])
-        m.t2_encoder.load_state_dict(global_encoders[3])
-        # residual FusionAdapter params are absent from global_decoder_prior
-        # and therefore left untouched (never downloaded either).
+ENCODER_ATTRS = ['flair_encoder', 't1ce_encoder', 't1_encoder', 't2_encoder']
+
+
+def broadcast_weights(model_clients, global_encoders, global_decoder_prior, masks):
+    """Send client k only the global encoders for modalities in its mask,
+    plus A0 and the decoder -- never an encoder for a modality it doesn't
+    hold (that client never trains it, so shipping it is wasted bandwidth),
+    and never the private residual (R_k), which is absent from
+    global_decoder_prior and therefore left untouched either way."""
+    for m, mask in zip(model_clients, masks):
+        for held, attr, state in zip(mask, ENCODER_ATTRS, global_encoders):
+            if held:
+                getattr(m, attr).load_state_dict(state)
         m.fusion_decoder.load_state_dict(global_decoder_prior, strict=False)
 
 
@@ -509,6 +514,7 @@ if __name__ == '__main__':
             client_idx + 1, len(data_set), len(valid_set), len(test_set)))
 
     best_dices = [0.0] * args.client_num
+    best_rounds = [-1] * args.client_num  # 0-indexed round (matches metrics.json round keys)
 
     ########## additional metrics (opt-in; see options.py) ##########
     voxel_spacing = tuple(args.voxel_spacing)
@@ -539,6 +545,7 @@ if __name__ == '__main__':
         'voxel_spacing': list(voxel_spacing), 'compute_hd95': args.compute_hd95,
         'compute_pers_gain': args.compute_pers_gain, 'eval_global_model': args.eval_global_model,
         'global_test_size': args.global_test_size, 'global_test_seed': args.global_test_seed,
+        'postproc': args.postproc, 'min_component_voxels': args.min_component_voxels,
     })
 
     global_test_loader = None
@@ -592,6 +599,7 @@ if __name__ == '__main__':
         global_decoder_prior = ckpt['global_decoder_prior']
         agg_state = ckpt['agg_state']
         best_dices = ckpt['best_dices']
+        best_rounds = ckpt.get('best_rounds', [-1] * args.client_num)
 
         print("load best result: {}".format(best_dices))
 
@@ -665,10 +673,11 @@ if __name__ == '__main__':
 
         log_round_stats(round, contributor_counts, agg_state, writer=writer)
 
-        broadcast_weights(model_clients, global_encoders, global_decoder_prior)
+        broadcast_weights(model_clients, global_encoders, global_decoder_prior, masks)
 
         for client_i in range(args.client_num):
-            metrics_recorder.comm.record_download(client_i, round, global_encoders, global_decoder_prior)
+            metrics_recorder.comm.record_download(
+                client_i, round, global_encoders, global_decoder_prior, masks[client_i])
 
         ##### Eval the model after aggregation and every args.eval rounds
         if should_evaluate:
@@ -708,6 +717,7 @@ if __name__ == '__main__':
 
                     if best_dices[c] < avgdice_score:
                         best_dices[c] = avgdice_score
+                        best_rounds[c] = round
                         torch.save({
                             'round': round+1,
                             'dice': dice_score,
@@ -753,28 +763,65 @@ if __name__ == '__main__':
                                 round, c + 1, float(np.mean(test_dice_matrix[c])) * 100.0,
                                 test_dice_matrix[c]))
 
-                if args.compute_hd95:
+                # HD95 is a reporting metric, not a tuning signal.  Compute it
+                # only once at the final round; validation Dice remains periodic.
+                # Every Dice/HD95 number here is reported twice -- raw and after
+                # --postproc -- so the effect of post-processing can be read off
+                # directly instead of guessed at.
+                if args.compute_hd95 and is_final_round:
                     hd95_results = fedmetrics.run_pooled(
                         args, list(range(args.client_num)), fedmetrics.evaluate_client,
                         lambda c: (args, validloader_clients[c], model_clients[c], args.local_devices[c],
-                                   masks[c], True, voxel_spacing))
+                                   masks[c], True, voxel_spacing, args.postproc, args.min_component_voxels))
                     hd95_matrix = [hd95_results[c]['hd95'] for c in range(args.client_num)]
                     round_payload['hd95_matrix'] = [list(map(float, v)) for v in hd95_matrix]
                     round_payload['hd95_edge_counts'] = {c: hd95_results[c]['edge_counts'] for c in range(args.client_num)}
+                    round_payload['hd95_valid_pairs_only_matrix'] = [
+                        hd95_results[c]['hd95_valid_pairs_only']
+                        for c in range(args.client_num)]
+                    round_payload['hd95_policy'] = hd95_results[0]['hd95_policy']
+                    round_payload['dice_postproc_matrix'] = [
+                        list(map(float, hd95_results[c]['dice_postproc'])) for c in range(args.client_num)]
+                    round_payload['hd95_postproc_matrix'] = [
+                        list(map(float, hd95_results[c]['hd95_postproc'])) for c in range(args.client_num)]
+                    round_payload['hd95_postproc_valid_pairs_only_matrix'] = [
+                        hd95_results[c]['hd95_postproc_valid_pairs_only']
+                        for c in range(args.client_num)]
+                    round_payload['postproc_edge_counts'] = {
+                        c: hd95_results[c]['postproc_edge_counts'] for c in range(args.client_num)}
+                    round_payload['postproc_policy'] = hd95_results[0]['postproc_policy']
                     for c in range(args.client_num):
-                        logging.info('--- Eval at round_{}, client_{} HD95(mm): {} | edge cases: {}'.format(
-                            round, c + 1, hd95_results[c]['hd95'], hd95_results[c]['edge_counts']))
+                        logging.info('--- Eval at round_{}, client_{} HD95(mm): {} | edge cases: {} | '
+                                     'postproc({}): Dice={} HD95(mm)={}'.format(
+                            round, c + 1, hd95_results[c]['hd95'], hd95_results[c]['edge_counts'],
+                            args.postproc, hd95_results[c]['dice_postproc'], hd95_results[c]['hd95_postproc']))
 
                     if is_final_round:
                         test_hd95_results = fedmetrics.run_pooled(
                             args, list(range(args.client_num)), fedmetrics.evaluate_client,
                             lambda c: (args, testloader_clients[c], model_clients[c],
-                                       args.local_devices[c], masks[c], True, voxel_spacing))
+                                       args.local_devices[c], masks[c], True, voxel_spacing,
+                                       args.postproc, args.min_component_voxels))
                         round_payload['test_hd95_matrix'] = [
                             list(map(float, test_hd95_results[c]['hd95']))
                             for c in range(args.client_num)]
                         round_payload['test_hd95_edge_counts'] = {
                             c: test_hd95_results[c]['edge_counts']
+                            for c in range(args.client_num)}
+                        round_payload['test_hd95_valid_pairs_only_matrix'] = [
+                            test_hd95_results[c]['hd95_valid_pairs_only']
+                            for c in range(args.client_num)]
+                        round_payload['test_dice_postproc_matrix'] = [
+                            list(map(float, test_hd95_results[c]['dice_postproc']))
+                            for c in range(args.client_num)]
+                        round_payload['test_hd95_postproc_matrix'] = [
+                            list(map(float, test_hd95_results[c]['hd95_postproc']))
+                            for c in range(args.client_num)]
+                        round_payload['test_hd95_postproc_valid_pairs_only_matrix'] = [
+                            test_hd95_results[c]['hd95_postproc_valid_pairs_only']
+                            for c in range(args.client_num)]
+                        round_payload['test_postproc_edge_counts'] = {
+                            c: test_hd95_results[c]['postproc_edge_counts']
                             for c in range(args.client_num)}
 
                 if args.compute_pers_gain:
@@ -815,51 +862,98 @@ if __name__ == '__main__':
                             if name.endswith('_residual'):
                                 parameter.zero_()
 
+                    # client_ceiling[k]: the full global model (all 4 global
+                    # encoders + A0, R=0, shared decoder) scored on client k's
+                    # OWN validation/test cases using ALL FOUR modalities --
+                    # every case has all four in the data even though client k
+                    # never trained on the ones outside its own mask. This is
+                    # the ceiling a non-personalised, full-modality model
+                    # reaches on that client's patients.
+                    # modality_deficit[k] = client_ceiling[k] - personalised_score[k]
+                    # is the per-client cost of missing modalities (+ lack of
+                    # personalisation) on that client's own patients.
+                    #
                     # dispatch the per-client pooled eval first, while global_model is
                     # still CPU-resident -- each spawned worker pickles its own copy,
                     # so this never mutates the parent's global_model in place.
-                    global_on_client_results = fedmetrics.run_pooled(
+                    full_mask = [True, True, True, True]
+                    client_ceiling_results = fedmetrics.run_pooled(
                         args, list(range(args.client_num)), fedmetrics.evaluate_client,
                         lambda c: (args, validloader_clients[c], global_model, args.local_devices[c],
-                                   masks[c], False, voxel_spacing))
-                    global_minus_client = {
-                        c: (global_on_client_results[c]['dice'] - dice_matrix[c]) for c in range(args.client_num)
+                                   full_mask, False, voxel_spacing))
+                    client_ceiling = {c: client_ceiling_results[c]['dice'] for c in range(args.client_num)}
+                    modality_deficit = {
+                        c: (client_ceiling[c] - dice_matrix[c]) for c in range(args.client_num)
                     }
-                    round_payload['global_minus_client'] = {
-                        c: list(map(float, global_minus_client[c])) for c in range(args.client_num)}
-                    round_payload['global_minus_client_partition'] = 'validation'
+                    round_payload['client_ceiling'] = {
+                        c: list(map(float, client_ceiling[c])) for c in range(args.client_num)}
+                    round_payload['modality_deficit'] = {
+                        c: list(map(float, modality_deficit[c])) for c in range(args.client_num)}
+                    round_payload['client_ceiling_partition'] = 'validation'
                     for c in range(args.client_num):
-                        logging.info('--- Eval at round_{}, client_{} global_minus_client (own modalities): {}'.format(
-                            round, c + 1, global_minus_client[c]))
+                        logging.info(
+                            '--- Eval at round_{}, client_{} client_ceiling (global model, all 4 modalities): {} | '
+                            'modality_deficit (ceiling - personalised): {}'.format(
+                                round, c + 1, client_ceiling[c], modality_deficit[c]))
 
                     if is_final_round:
-                        global_on_test_results = fedmetrics.run_pooled(
+                        test_client_ceiling_results = fedmetrics.run_pooled(
                             args, list(range(args.client_num)), fedmetrics.evaluate_client,
                             lambda c: (args, testloader_clients[c], global_model,
-                                       args.local_devices[c], masks[c], False, voxel_spacing))
-                        test_global_minus_client = {
-                            c: (global_on_test_results[c]['dice'] - test_dice_matrix[c])
+                                       args.local_devices[c], full_mask, False, voxel_spacing))
+                        test_client_ceiling = {
+                            c: test_client_ceiling_results[c]['dice'] for c in range(args.client_num)}
+                        test_modality_deficit = {
+                            c: (test_client_ceiling[c] - test_dice_matrix[c])
                             for c in range(args.client_num)}
-                        round_payload['test_global_minus_client'] = {
-                            c: list(map(float, test_global_minus_client[c]))
+                        round_payload['test_client_ceiling'] = {
+                            c: list(map(float, test_client_ceiling[c])) for c in range(args.client_num)}
+                        round_payload['test_modality_deficit'] = {
+                            c: list(map(float, test_modality_deficit[c]))
                             for c in range(args.client_num)}
 
                         # This is the only access to the shared held-out test set.
                         # It runs in-process after all pooled evaluations are done.
                         global_test_result = fedmetrics.evaluate_client(
                             args, global_test_loader, global_model, args.device,
-                            [True, True, True, True], True, voxel_spacing)
+                            full_mask, True, voxel_spacing, args.postproc, args.min_component_voxels)
                         round_payload['global_model'] = {
                             'dice': list(map(float, global_test_result['dice'])),
                             'hd95': list(map(float, global_test_result['hd95'])),
+                            'hd95_valid_pairs_only': global_test_result['hd95_valid_pairs_only'],
+                            'hd95_policy': global_test_result['hd95_policy'],
                             'edge_counts': global_test_result['edge_counts'],
+                            'dice_postproc': list(map(float, global_test_result['dice_postproc'])),
+                            'hd95_postproc': list(map(float, global_test_result['hd95_postproc'])),
+                            'hd95_postproc_valid_pairs_only': global_test_result['hd95_postproc_valid_pairs_only'],
+                            'postproc_policy': global_test_result['postproc_policy'],
+                            'postproc_edge_counts': global_test_result['postproc_edge_counts'],
                             'n_cases': global_test_result['n_cases'],
                             'partition': 'global_held_out_test',
                             'private_residual_zeroed': True,
                         }
                         logging.info(
-                            '--- FINAL GLOBAL TEST at round_{}, Dice={} HD95(mm)={}'.format(
-                                round, global_test_result['dice'], global_test_result['hd95']))
+                            '--- FINAL GLOBAL TEST at round_{}, Dice={} HD95(mm)={} | postproc({}): '
+                            'Dice={} HD95(mm)={}'.format(
+                                round, global_test_result['dice'], global_test_result['hd95'],
+                                args.postproc, global_test_result['dice_postproc'],
+                                global_test_result['hd95_postproc']))
+
+                if is_final_round:
+                    convergence = {}
+                    for c in range(args.client_num):
+                        not_converged = best_rounds[c] == round
+                        convergence[c] = {
+                            'best_round': best_rounds[c],
+                            'best_validation_dice': best_dices[c],
+                            'converged': not not_converged,
+                        }
+                        if not_converged:
+                            logging.warning(
+                                'Client_{} had not converged: its best validation round ({}) is the last '
+                                'evaluated round ({}); validation Dice may still have been rising when '
+                                'training stopped.'.format(c + 1, best_rounds[c] + 1, round + 1))
+                    round_payload['convergence'] = convergence
 
                 metrics_recorder.record_round(round, round_payload)
                 metrics_recorder.flush()
@@ -878,6 +972,7 @@ if __name__ == '__main__':
             'agg_state': agg_state,
 
             'best_dices': best_dices,
+            'best_rounds': best_rounds,
             'split_metadata': split_metadata,
             }, args.modelfile_path + '/last.pth')
 
