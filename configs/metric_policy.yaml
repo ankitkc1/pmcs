@@ -1,0 +1,59 @@
+# Metric policy for offline re-scoring (evaluate.py) and, from this release
+# on, for the live end-of-training report writer as well -- both paths load
+# this same file so a policy change (e.g. a different min_component_voxels)
+# can never silently diverge between training-time and offline numbers.
+#
+# Region post-processing is intentionally NOT symmetric across regions:
+#   - WT (whole tumour) is normally one connected mass, so keeping only its
+#     largest connected component is a safe way to drop scattered
+#     false-positive voxels far from the tumour.
+#   - TC (tumour core) and ET (enhancing tumour) are frequently multifocal or
+#     ring-shaped with genuinely disconnected true-positive components.
+#     Applying largest_cc there would delete real tumour, not noise -- so
+#     they use size_filter instead, which drops only components smaller than
+#     min_component_voxels and keeps every component at or above it,
+#     however many there are.
+postproc:
+  WT:
+    method: largest_cc
+    min_component_voxels: 50
+  TC:
+    method: size_filter
+    min_component_voxels: 50
+  ET:
+    method: size_filter
+    min_component_voxels: 50
+  # BraTS-challenge convention: if the predicted ET region is smaller than
+  # this many voxels, treat it as empty. This is because a tiny predicted ET
+  # blob against an empty ground-truth ET is scored as a near-total failure
+  # under the standard empty-mask convention, so predicting nothing at all is
+  # frequently the better decision below this size. Set to 0 to disable.
+  # Reported both with and without this threshold applied so its effect on
+  # ET specifically is visible rather than baked silently into one number.
+  et_volume_threshold: 500
+  # Independent per-region filtering (different methods, different kept
+  # components) can leave TC voxels outside the post-processed WT, or ET
+  # voxels outside the post-processed TC. When true, re-derive TC and ET by
+  # intersecting downward from WT (TC := TC AND WT, ET := ET AND TC) after
+  # per-region filtering, and assert the nesting holds on the result.
+  enforce_nesting: true
+
+# Voxel spacing (mm) this policy assumes the data was resampled to. Per-case
+# spacing is read from the source NIfTI affine (see --nifti-root in
+# evaluate.py) and asserted to match this value within 1e-3; a mismatch
+# raises rather than silently scoring with the wrong spacing. When no NIfTI
+# source is available for a case (the .npy-preprocessed BraTS2020 pipeline
+# this repo trains on does not carry its own affine), this value is used
+# directly as that case's spacing and is recorded in the report exactly as
+# used -- there is no remaining hardcoded [1, 1, 1] in code, only this single
+# configured, reported, and (where possible) verified value.
+expected_spacing_mm: [1.0, 1.0, 1.0]
+
+# Tolerances (mm) at which normalised surface distance (NSD) is reported.
+nsd_tolerances_mm: [1.0, 3.0]
+
+# fp32 checkpoints/parameters throughout this codebase.
+dtype_bytes: 4
+
+# Dice(%) targets for the rounds-to-target / bytes-to-target-Dice curves.
+target_dice: [50, 55, 60, 65]

@@ -14,7 +14,6 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from dataset.data_utils import init_fn
 import copy
-import hashlib
 import json
 
 
@@ -23,9 +22,11 @@ from utils.fl_utils import avg_EW
 from utils import criterions
 from dataset.datasets import Brats_test, Brats_train
 from dataset.global_split import build_global_test_split
+from dataset.split_io import load_materialized_split
 from options import args_parser
 from utils.predict import local_test
 from utils import metrics as fedmetrics
+from utils import encoder_coverage as coverage_mod
 
 MODAL_NAMES = ['flair', 't1ce', 't1', 't2']
 
@@ -60,114 +61,6 @@ def build_client_split_files(setting_options, dataname, client_num):
     else:
         subdir = '18_c4_c6'
     return {i: os.path.abspath(os.path.join('split', subdir, 'c{}.csv'.format(i))) for i in range(1, client_num + 1)}
-
-
-def _read_case_ids(path):
-    with open(path, 'r') as handle:
-        return [line.strip() for line in handle if line.strip()]
-
-
-def load_materialized_split(config_path, client_num, data_seed):
-    """Load and defensively validate a materialized paired-split config."""
-    config_path = os.path.abspath(config_path)
-    with open(config_path, 'r') as handle:
-        config = json.load(handle)
-
-    if config.get('modality_order') != ['FLAIR', 'T1ce', 'T1', 'T2']:
-        raise ValueError('split config modality order must be [FLAIR, T1ce, T1, T2]')
-    if int(config.get('data_seed', -1)) != int(data_seed):
-        raise ValueError('split config data_seed does not match --data_seed')
-    if client_num != 8 or config.get('split_id') not in ('A', 'B'):
-        raise ValueError('paired Split A/B requires exactly 8 clients')
-
-    client_ids = ['C{}'.format(i) for i in range(1, client_num + 1)]
-    if sorted(config.get('clients', {})) != sorted(client_ids):
-        raise ValueError('split config client set does not match --client_num')
-    if sorted(config.get('masks', {})) != sorted(client_ids):
-        raise ValueError('split config mask set does not match --client_num')
-
-    masks = []
-    train_files, validation_files, test_files = {}, {}, {}
-    all_client_cases = set()
-    assignment_hasher = hashlib.sha256()
-    config_dir = os.path.dirname(config_path)
-
-    def resolve_path(value):
-        path = value if os.path.isabs(value) else os.path.join(config_dir, value)
-        path = os.path.abspath(path)
-        if not os.path.isfile(path):
-            raise ValueError('split file does not exist: {}'.format(path))
-        return path
-
-    for index, client_id in enumerate(client_ids, start=1):
-        mask = [bool(value) for value in config['masks'][client_id]]
-        if len(mask) != 4 or not any(mask):
-            raise ValueError('{} has an invalid/empty modality mask'.format(client_id))
-        masks.append(mask)
-
-        record = config['clients'][client_id]
-        client_cases = set()
-        for partition, destination in (
-                ('train', train_files), ('validation', validation_files), ('test', test_files)):
-            path = resolve_path(record['files'][partition])
-            case_ids = _read_case_ids(path)
-            expected = int(record['partition_counts'][partition])
-            if len(case_ids) != expected or len(case_ids) != len(set(case_ids)):
-                raise ValueError('{} {} count/uniqueness check failed'.format(client_id, partition))
-            overlap = client_cases.intersection(case_ids)
-            if overlap:
-                raise ValueError('{} partitions overlap: {}'.format(client_id, sorted(overlap)))
-            client_cases.update(case_ids)
-            destination[index] = path
-            assignment_hasher.update(
-                ('{}|{}|{}\n'.format(client_id, partition, '\n'.join(case_ids))).encode('utf-8'))
-
-        overlap = all_client_cases.intersection(client_cases)
-        if overlap:
-            raise ValueError('patients occur in multiple clients: {}'.format(sorted(overlap)))
-        all_client_cases.update(client_cases)
-
-    expected_split_a_masks = [
-        [True, True, True, True], [True, True, True, False],
-        [True, False, True, True], [True, False, True, False],
-        [True, False, False, True], [True, False, False, False],
-        [True, False, True, False], [False, False, False, True],
-    ]
-    expected_masks = expected_split_a_masks
-    if config['split_id'] == 'B':
-        expected_masks = [
-            [mask[1], mask[0], mask[2], mask[3]]
-            for mask in expected_split_a_masks]
-    if masks != expected_masks:
-        raise ValueError('Split {} masks do not match the registered design'.format(
-            config['split_id']))
-
-    actual_pools = {
-        name: sum(int(mask[m]) for mask in masks)
-        for m, name in enumerate(['FLAIR', 'T1ce', 'T1', 'T2'])
-    }
-    expected_pools = {name: int(value) for name, value in config['expected_modality_pool_sizes'].items()}
-    if actual_pools != expected_pools:
-        raise ValueError('modality pool sizes do not match materialized config')
-
-    global_test_file = resolve_path(config['global_test_file'])
-    global_cases = _read_case_ids(global_test_file)
-    if len(global_cases) != 50 or len(global_cases) != len(set(global_cases)):
-        raise ValueError('global held-out test must contain 50 unique cases')
-    overlap = all_client_cases.intersection(global_cases)
-    if overlap:
-        raise ValueError('global held-out test overlaps clients: {}'.format(sorted(overlap)))
-
-    metadata = {
-        'split_id': config['split_id'],
-        'data_seed': int(config['data_seed']),
-        'mapping_fingerprint': config['mapping_fingerprint'],
-        'patient_assignment_fingerprint': assignment_hasher.hexdigest(),
-        'modality_order': config['modality_order'],
-        'masks': masks,
-        'global_test_file': global_test_file,
-    }
-    return masks, train_files, validation_files, test_files, global_test_file, metadata
 
 
 def self_cuda(obj, device):
@@ -548,6 +441,27 @@ if __name__ == '__main__':
         'postproc': args.postproc, 'min_component_voxels': args.min_component_voxels,
     })
 
+    ##### per-modality-encoder coverage instrumentation (Task 6): tracks,
+    ##### every round, whether each modality's encoder got a FedAvg
+    ##### contributor, how many, and how many consecutive rounds it has gone
+    ##### without one. Pure bookkeeping fed by contributor_counts that
+    ##### aggregate_encoders() already computes each round; never touches
+    ##### training/aggregation itself.
+    encoder_pool_sizes = {
+        name: sum(1 for mask in masks if mask[i])
+        for i, name in enumerate(coverage_mod.MODALITY_NAMES)
+    }
+    metrics_recorder.set_static('encoder_pool_sizes', encoder_pool_sizes)
+    coverage_tracker = coverage_mod.EncoderCoverageTracker(coverage_mod.MODALITY_NAMES)
+    if args.resume != 0:
+        # Rebuild from whatever per-round contributor_counts try_resume()
+        # already loaded into metrics_recorder.rounds, rather than requiring
+        # a separate checkpointed tracker state.
+        for r in sorted(metrics_recorder.rounds.keys()):
+            counts = metrics_recorder.rounds[r].get('contributor_counts')
+            if counts is not None:
+                coverage_tracker.record_round(r, counts)
+
     global_test_loader = None
     if args.eval_global_model:
         if materialized_split:
@@ -672,10 +586,20 @@ if __name__ == '__main__':
         global_decoder_prior = aggregate_decoder(local_decoders, active_clients)
 
         log_round_stats(round, contributor_counts, agg_state, writer=writer)
+        coverage_tracker.record_round(round, contributor_counts)
+        # Persisted every round (not just eval rounds) so a resume can replay
+        # the tracker exactly; flush() below writes the whole in-memory
+        # self.rounds dict each time, so this reaches disk at the next flush
+        # regardless of which round it happened on.
+        metrics_recorder.record_round(round, {'contributor_counts': contributor_counts})
 
         broadcast_weights(model_clients, global_encoders, global_decoder_prior, masks)
 
-        for client_i in range(args.client_num):
+        # Only clients selected this round are counted as having downloaded
+        # anything -- at full participation this is every client, but a
+        # future reduced-participation sweep must not silently bill an idle
+        # client for bytes it never actually received this round.
+        for client_i in active_clients:
             metrics_recorder.comm.record_download(
                 client_i, round, global_encoders, global_decoder_prior, masks[client_i])
 
@@ -954,6 +878,15 @@ if __name__ == '__main__':
                                 'evaluated round ({}); validation Dice may still have been rising when '
                                 'training stopped.'.format(c + 1, best_rounds[c] + 1, round + 1))
                     round_payload['convergence'] = convergence
+
+                # Recomputed fresh from the tracker's full accumulated
+                # history on every flush (cheap; pure arithmetic over
+                # already-recorded per-round contributor counts), so this
+                # field is always consistent with metrics_recorder.rounds
+                # rather than a stale snapshot from whenever it was last set.
+                metrics_recorder.set_static('encoder_coverage', coverage_mod.summarize(
+                    coverage_tracker, encoder_pool_sizes, total_clients=args.client_num,
+                    participation_k=len(active_clients)))
 
                 metrics_recorder.record_round(round, round_payload)
                 metrics_recorder.flush()
