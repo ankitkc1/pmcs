@@ -43,6 +43,34 @@ REQUIRED_TOP_LEVEL_FIELDS = [
     'provenance',
 ]
 
+# Base names that must each appear as "{partition}_{basename}" (see
+# partitioned_key), where `partition` is report['evaluation_partition'].
+# These carry the actual per-region numbers -- a report can satisfy every
+# name in REQUIRED_TOP_LEVEL_FIELDS (all metadata/bookkeeping) while still
+# being missing the Dice/HD95 matrices themselves, which is exactly the
+# hole this closes.
+REQUIRED_PARTITION_MATRIX_BASENAMES = [
+    'dice_matrix',
+    'dice_postproc_matrix',
+    'hd95_matrix',
+    'hd95_postproc_matrix',
+    'hd95_valid_pairs_only_matrix',
+    'personalisation_gain_matrix',
+]
+
+# Additional top-level fields required regardless of partition: the
+# canonical global-model block, per-case distributional stats, the
+# cross-client fairness summary, and evidence that residual zeroing actually
+# happened (see the residual_zeroing_log / global_model checks below).
+REQUIRED_ADDITIONAL_FIELDS = [
+    'global_model',
+    'per_case_stats',
+    'fairness',
+    'residual_zeroing_log',
+]
+
+REQUIRED_GLOBAL_MODEL_FIELDS = ('dice', 'per_region', 'n_cases', 'partition', 'private_residual_zeroed')
+
 
 class ReportValidationError(Exception):
     """Raised by validate_report() with every problem found, not just the first."""
@@ -113,7 +141,20 @@ def validate_report(report: dict) -> None:
       (b) report['evaluation_partition'] is one of VALID_PARTITIONS;
       (c) report['round_selection'] is a dict with 'mode' in
           VALID_ROUND_SELECTIONS and an int 'round_index';
-      (d) no NaN/+-inf anywhere in the tree (dotted-path locations of every
+      (d) every name in REQUIRED_PARTITION_MATRIX_BASENAMES is present under
+          its "{partition}_" key -- a report can carry every metadata field
+          and still be missing the actual Dice/HD95 numbers, which is a
+          structurally incomplete report just as much as a missing metadata
+          field is;
+      (e) every name in REQUIRED_ADDITIONAL_FIELDS is present, and
+          'global_model'/'residual_zeroing_log' additionally carry real
+          evidence (not just the key existing): global_model has all of
+          REQUIRED_GLOBAL_MODEL_FIELDS and private_residual_zeroed is
+          literally True; residual_zeroing_log is a non-empty mapping whose
+          every value is itself a non-empty list of zeroed tensor names (a
+          report where zeroing silently matched nothing must fail here even
+          if evaluate.py's own runtime assertion were ever bypassed);
+      (f) no NaN/+-inf anywhere in the tree (dotted-path locations of every
           offender are collected into the error message).
     """
     problems = []
@@ -124,6 +165,12 @@ def validate_report(report: dict) -> None:
             "missing required top-level field(s): %s" % ', '.join(missing)
         )
 
+    missing_additional = [f for f in REQUIRED_ADDITIONAL_FIELDS if f not in report]
+    if missing_additional:
+        problems.append(
+            "missing required field(s): %s" % ', '.join(missing_additional)
+        )
+
     if 'evaluation_partition' in report:
         partition = report['evaluation_partition']
         if partition not in VALID_PARTITIONS:
@@ -131,6 +178,49 @@ def validate_report(report: dict) -> None:
                 "evaluation_partition must be one of %r, got %r"
                 % (VALID_PARTITIONS, partition)
             )
+        else:
+            missing_matrices = [
+                partitioned_key(basename, partition)
+                for basename in REQUIRED_PARTITION_MATRIX_BASENAMES
+                if partitioned_key(basename, partition) not in report
+            ]
+            if missing_matrices:
+                problems.append(
+                    "missing required partition-specific field(s) for evaluation_partition=%r: %s"
+                    % (partition, ', '.join(missing_matrices))
+                )
+
+    if 'global_model' in report:
+        global_model = report['global_model']
+        if not isinstance(global_model, dict):
+            problems.append("global_model must be a dict, got %r" % (type(global_model),))
+        else:
+            missing_gm_fields = [f for f in REQUIRED_GLOBAL_MODEL_FIELDS if f not in global_model]
+            if missing_gm_fields:
+                problems.append(
+                    "global_model missing required sub-field(s): %s" % ', '.join(missing_gm_fields)
+                )
+            elif global_model['private_residual_zeroed'] is not True:
+                problems.append(
+                    "global_model['private_residual_zeroed'] must be literally True, got %r"
+                    % (global_model['private_residual_zeroed'],)
+                )
+
+    if 'residual_zeroing_log' in report:
+        log = report['residual_zeroing_log']
+        if not isinstance(log, dict) or not log:
+            problems.append(
+                "residual_zeroing_log must be a non-empty dict mapping each entity to the "
+                "list of *_residual tensor names that were actually zeroed"
+            )
+        else:
+            empty_entries = [k for k, v in log.items() if not v]
+            if empty_entries:
+                problems.append(
+                    "residual_zeroing_log has empty (zero tensors touched) entries for: %s -- "
+                    "a residual-zeroed comparison built from these would be silently identical "
+                    "to the personalised one" % ', '.join(sorted(empty_entries))
+                )
 
     if 'round_selection' in report:
         round_selection = report['round_selection']
@@ -206,7 +296,7 @@ if __name__ == '__main__':
     import copy
 
     def _make_minimal_valid_report():
-        return {
+        report = {
             'schema_version': SCHEMA_VERSION,
             'accounting_version': ACCOUNTING_VERSION,
             'evaluation_partition': 'test',
@@ -222,7 +312,20 @@ if __name__ == '__main__':
             'hd95_policy': 'mismatch_empty_penalty',
             'client_modalities': {0: ['FLAIR', 'T1ce', 'T1', 'T2']},
             'provenance': {'git_commit': 'deadbeef', 'run_id': 'splitA_150r'},
+            'global_model': {
+                'dice': {'mean': 0.6, 'n_cases': 50},
+                'per_region': {'WT': {'dice_raw': {'mean': 0.6}}},
+                'n_cases': 50,
+                'partition': 'global_held_out_test',
+                'private_residual_zeroed': True,
+            },
+            'per_case_stats': {'client_0': {'WT': {'dice_raw': {'mean': 0.5, 'n_cases': 6}}}},
+            'fairness': {'worst_client': 3, 'best_client': 0, 'std_across_clients': 0.05},
+            'residual_zeroing_log': {'client_0': ['fusion_decoder.adapter.conv_weight_residual']},
         }
+        for basename in REQUIRED_PARTITION_MATRIX_BASENAMES:
+            report[partitioned_key(basename, 'test')] = {0: [0.5, 0.5, 0.5]}
+        return report
 
     # --- partitioned_key ---
     assert partitioned_key('dice_matrix', 'test') == 'test_dice_matrix'
@@ -276,6 +379,81 @@ if __name__ == '__main__':
         raise AssertionError("validate_report should have raised for missing field")
     except ReportValidationError as exc:
         assert 'hd95_policy' in str(exc)
+
+    # --- validate_report: missing partition-specific matrix -----------------
+    missing_matrix = copy.deepcopy(good)
+    del missing_matrix[partitioned_key('hd95_postproc_matrix', 'test')]
+    try:
+        validate_report(missing_matrix)
+        raise AssertionError("validate_report should have raised for a missing partition matrix")
+    except ReportValidationError as exc:
+        assert 'test_hd95_postproc_matrix' in str(exc)
+
+    # A report with every metadata field present but ALL matrices missing
+    # must still fail -- metadata completeness alone is not enough.
+    metadata_only = copy.deepcopy(good)
+    for basename in REQUIRED_PARTITION_MATRIX_BASENAMES:
+        del metadata_only[partitioned_key(basename, 'test')]
+    try:
+        validate_report(metadata_only)
+        raise AssertionError("validate_report should have raised when all matrices are missing")
+    except ReportValidationError as exc:
+        msg = str(exc)
+        for basename in REQUIRED_PARTITION_MATRIX_BASENAMES:
+            assert partitioned_key(basename, 'test') in msg
+
+    # --- validate_report: missing global_model / per_case_stats / fairness /
+    # residual_zeroing_log ----------------------------------------------------
+    for field in ('global_model', 'per_case_stats', 'fairness', 'residual_zeroing_log'):
+        missing_additional = copy.deepcopy(good)
+        del missing_additional[field]
+        try:
+            validate_report(missing_additional)
+            raise AssertionError("validate_report should have raised for missing %r" % field)
+        except ReportValidationError as exc:
+            assert field in str(exc)
+
+    # --- validate_report: global_model missing a required sub-field ---------
+    incomplete_global = copy.deepcopy(good)
+    del incomplete_global['global_model']['n_cases']
+    try:
+        validate_report(incomplete_global)
+        raise AssertionError("validate_report should have raised for incomplete global_model")
+    except ReportValidationError as exc:
+        assert 'global_model' in str(exc) and 'n_cases' in str(exc)
+
+    # --- validate_report: global_model claiming residual NOT zeroed --------
+    fake_global = copy.deepcopy(good)
+    fake_global['global_model']['private_residual_zeroed'] = False
+    try:
+        validate_report(fake_global)
+        raise AssertionError("validate_report should have raised when private_residual_zeroed is False")
+    except ReportValidationError as exc:
+        assert 'private_residual_zeroed' in str(exc)
+
+    # --- validate_report: residual_zeroing_log empty / has an empty entry ---
+    empty_log = copy.deepcopy(good)
+    empty_log['residual_zeroing_log'] = {}
+    try:
+        validate_report(empty_log)
+        raise AssertionError("validate_report should have raised for an empty residual_zeroing_log")
+    except ReportValidationError as exc:
+        assert 'residual_zeroing_log' in str(exc)
+
+    # The exact failure mode this guards against: zeroing silently matched
+    # zero tensors for one client (e.g. a renamed parameter) while every
+    # other client's log entry is fine -- must still fail, and must name
+    # which entity was empty.
+    one_empty_entry = copy.deepcopy(good)
+    one_empty_entry['residual_zeroing_log'] = {
+        'client_0': ['fusion_decoder.adapter.conv_weight_residual'],
+        'client_1': [],
+    }
+    try:
+        validate_report(one_empty_entry)
+        raise AssertionError("validate_report should have raised for a client with zero zeroed tensors")
+    except ReportValidationError as exc:
+        assert 'client_1' in str(exc)
 
     # --- validate_report: NaN nested deep, with a locatable dotted path ---
     nan_report = copy.deepcopy(good)
@@ -370,12 +548,18 @@ if __name__ == '__main__':
     assert should_emit_rounds_to_target([]) is False
     assert should_emit_rounds_to_target([9, 9, 9]) is False
 
-    # --- REQUIRED_TOP_LEVEL_FIELDS sanity ---
+    # --- REQUIRED_TOP_LEVEL_FIELDS / REQUIRED_ADDITIONAL_FIELDS sanity ---
     for name in (
         'schema_version', 'accounting_version', 'evaluation_partition',
         'round_selection', 'communication', 'encoder_coverage',
         'postproc_policy', 'hd95_policy', 'client_modalities', 'provenance',
     ):
         assert name in REQUIRED_TOP_LEVEL_FIELDS
+    for name in ('global_model', 'per_case_stats', 'fairness', 'residual_zeroing_log'):
+        assert name in REQUIRED_ADDITIONAL_FIELDS
+    for name in ('dice_matrix', 'dice_postproc_matrix', 'hd95_matrix',
+                 'hd95_postproc_matrix', 'hd95_valid_pairs_only_matrix',
+                 'personalisation_gain_matrix'):
+        assert name in REQUIRED_PARTITION_MATRIX_BASENAMES
 
     print("ALL TESTS PASSED")

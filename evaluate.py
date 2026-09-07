@@ -164,26 +164,40 @@ def predict_case(model, x, mask, device, patch_size=80):
 # ---------------------------------------------------------------------------
 
 def resolve_spacing_mm(case_id, nifti_root, expected_spacing_mm, tolerance=1e-3):
-    """Returns (spacing_mm, source). If nifti_root is given and a matching
-    file is found, reads the real affine via nibabel and asserts it matches
-    expected_spacing_mm within `tolerance`, raising on mismatch. Otherwise
-    uses expected_spacing_mm directly and says so -- this is a config value,
-    not a code-level hardcoded constant, and the report always records which
-    one actually happened."""
-    if nifti_root:
-        import glob
-        import nibabel as nib
-        candidates = glob.glob(os.path.join(nifti_root, '**', '{}*.nii*'.format(case_id)), recursive=True)
-        if candidates:
-            img = nib.load(candidates[0])
-            spacing = tuple(float(v) for v in img.header.get_zooms()[:3])
-            expected = tuple(float(v) for v in expected_spacing_mm)
-            if any(abs(a - b) > tolerance for a, b in zip(spacing, expected)):
-                raise ValueError(
-                    'case {}: observed NIfTI spacing {} does not match configured '
-                    'expected_spacing_mm {} (tolerance {})'.format(case_id, spacing, expected, tolerance))
-            return spacing, 'nifti_affine:{}'.format(candidates[0])
-    return tuple(float(v) for v in expected_spacing_mm), 'policy_default (no --nifti-root match)'
+    """Returns (spacing_mm, source).
+
+    If nifti_root is NOT given at all, uses expected_spacing_mm directly and
+    says so -- this is a configured value, not a code-level hardcoded
+    constant, and the report always records that no real per-case check was
+    performed.
+
+    If nifti_root IS given, a real per-case check was explicitly requested:
+    a matching file must be found and its affine must match
+    expected_spacing_mm within `tolerance`. Both "no matching file" and "the
+    file's spacing doesn't match" raise -- silently falling back to the
+    configured default here would defeat the entire point of passing
+    --nifti-root, indistinguishable from never having passed it.
+    """
+    if not nifti_root:
+        return tuple(float(v) for v in expected_spacing_mm), 'policy_default (--nifti-root not supplied)'
+
+    import glob
+    import nibabel as nib
+    candidates = glob.glob(os.path.join(nifti_root, '**', '{}*.nii*'.format(case_id)), recursive=True)
+    if not candidates:
+        raise FileNotFoundError(
+            'case {}: --nifti-root {!r} was supplied but no matching NIfTI file was found under it -- '
+            'refusing to silently fall back to the configured expected_spacing_mm for a case that was '
+            'supposed to get a real per-case spacing check.'.format(case_id, nifti_root))
+
+    img = nib.load(candidates[0])
+    spacing = tuple(float(v) for v in img.header.get_zooms()[:3])
+    expected = tuple(float(v) for v in expected_spacing_mm)
+    if any(abs(a - b) > tolerance for a, b in zip(spacing, expected)):
+        raise ValueError(
+            'case {}: observed NIfTI spacing {} does not match configured '
+            'expected_spacing_mm {} (tolerance {})'.format(case_id, spacing, expected, tolerance))
+    return spacing, 'nifti_affine:{}'.format(candidates[0])
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +218,34 @@ def load_entity_masks(save_dir, entity_id, case_id):
     stacked = data['masks'].astype(bool)
     regions = list(data['regions'])
     return {r: stacked[regions.index(r)] for r in REGIONS}
+
+
+def save_residual_zeroing_log(save_dir, residual_touch_log):
+    """Persists the evidence that residual zeroing actually touched a
+    non-empty set of tensors for every client, alongside the saved
+    prediction masks, so a later --from-predictions re-score can carry that
+    evidence forward instead of reporting an empty (and therefore
+    schema-invalid) residual_zeroing_log."""
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, 'residual_zeroing_log.json'), 'w') as f:
+        json.dump(residual_touch_log, f, indent=2)
+
+
+def load_residual_zeroing_log(save_dir):
+    path = os.path.join(save_dir, 'residual_zeroing_log.json')
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            '--from-predictions {} has no residual_zeroing_log.json -- it was not created by a prior '
+            '--save-predictions run of this evaluate.py, so there is no evidence that residual zeroing '
+            'ever touched a non-empty set of tensors for these saved masks. Refusing to assemble a report '
+            'with a fabricated or empty residual_zeroing_log.'.format(save_dir))
+    with open(path, 'r') as f:
+        log = json.load(f)
+    if not log or not all(v for v in log.values()):
+        raise ValueError(
+            '{} exists but is empty or has an entity with zero zeroed tensors -- refusing to '
+            'assemble a report from it.'.format(path))
+    return log
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +423,8 @@ def build_region_matrix(per_client_case_results, field):
 
 def assemble_report(args, policy, masks, client_modalities, rounds,
                      per_client_case_results, per_client_residual_zeroed_results,
-                     global_model_case_results, round_selection, wall_clock_seconds=None):
+                     global_model_case_results, round_selection, wall_clock_seconds=None,
+                     per_client_on_global_test_results=None):
     partition = args.partition
     client_num = len(masks)
 
@@ -417,6 +460,21 @@ def assemble_report(args, policy, masks, client_modalities, rounds,
                     'region': region, 'spacing_mm': row['spacing_mm'], 'spacing_source': row['spacing_source'],
                     **s,
                 })
+    # Residual-zeroed per-case records: without these, per-case
+    # personalisation gain (residual-zeroed vs personalised, matched by
+    # case_id) cannot be computed from the final per-case table at all --
+    # only the pre-aggregated mean-based residual_zeroed_minus_personalised
+    # matrix would be available.
+    for c, rows in per_client_residual_zeroed_results.items():
+        for row in rows:
+            for region in REGIONS:
+                s = row['scores'][region]
+                per_case_records.append({
+                    'entity': 'client_{}_residual_zeroed'.format(c), 'partition': partition,
+                    'case_id': row['case_id'], 'region': region, 'spacing_mm': row['spacing_mm'],
+                    'spacing_source': row['spacing_source'],
+                    **s,
+                })
     for row in global_model_case_results:
         for region in REGIONS:
             s = row['scores'][region]
@@ -425,6 +483,29 @@ def assemble_report(args, policy, masks, client_modalities, rounds,
                 'region': region, 'spacing_mm': row['spacing_mm'], 'spacing_source': row['spacing_source'],
                 **s,
             })
+
+    # Each client's own personalised model scored on the SAME shared
+    # 50-case held-out set as every other client and the global model --
+    # unlike per_client_case_results (each client's own, disjoint, ~6-case
+    # partition), these rows share case_id across clients, which is what
+    # makes a paired per-case comparison (e.g. Wilcoxon between two
+    # clients' Dice on the identical 50 cases) possible at all.
+    client_on_global_test_matrix = {}
+    per_client_on_global_test_results = per_client_on_global_test_results or {}
+    for c, rows in per_client_on_global_test_results.items():
+        for row in rows:
+            for region in REGIONS:
+                s = row['scores'][region]
+                per_case_records.append({
+                    'entity': 'client_{}_on_global_test'.format(c), 'partition': 'global_held_out_test',
+                    'case_id': row['case_id'], 'region': region, 'spacing_mm': row['spacing_mm'],
+                    'spacing_source': row['spacing_source'],
+                    **s,
+                })
+        client_on_global_test_matrix[c] = [
+            stats_mod.distribution_stats(aggregate_region_field(rows, region, 'dice_raw'))['mean']
+            for region in REGIONS
+        ]
 
     per_case_stats = {}
     for entity_key, rows in list(per_client_case_results.items()) + [('global', global_model_case_results)]:
@@ -478,6 +559,16 @@ def assemble_report(args, policy, masks, client_modalities, rounds,
         'residual_zeroed_minus_personalised': residual_zeroed_minus_personalised,
         'per_case_stats': per_case_stats,
         'fairness': fairness,
+        # Each client's own personalised model, scored on the same shared
+        # 50-case global_held_out_test set the canonical global model uses.
+        # Because every client shares the identical 50 case_ids here (unlike
+        # dice_matrix, where each client has its own disjoint partition),
+        # per_case_records for entity "client_{k}_on_global_test" can be
+        # paired by case_id across any two clients and fed directly into
+        # utils.stats.wilcoxon_paired for a same-sample significance test --
+        # that pairing is impossible from dice_matrix/per_client_case_results
+        # alone, since no two clients evaluate the same cases there.
+        'client_on_global_test_dice_matrix': client_on_global_test_matrix,
         'global_model': {
             'dice': stats_mod.distribution_stats(
                 [np.mean([row['scores'][r]['dice_raw'] for r in REGIONS]) for row in global_model_case_results]),
@@ -545,9 +636,50 @@ def write_per_case_csv(path, records):
                               for k, v in r.items()})
 
 
+def write_per_case_parquet(path, records):
+    """The primary per-case artifact (Task 7): every raw and post-processed
+    metric, per case, per region, per entity -- never collapsed to a mean
+    before it reaches disk. Nested fields (edge_counts, nsd_raw/postproc,
+    spacing_mm) are stored as native parquet struct/list columns rather than
+    JSON-stringified, unlike the CSV companion, since parquet's columnar
+    format handles them natively and this keeps them queryable without a
+    JSON-parsing step."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if not records:
+        # Still write an (empty) file rather than silently producing
+        # nothing -- a downstream reader expecting this path to exist
+        # should see zero rows, not a missing file.
+        pq.write_table(pa.table({}), path)
+        return
+    table = pa.Table.from_pylist(to_jsonable(records))
+    pq.write_table(table, path)
+
+
 # ---------------------------------------------------------------------------
 # Acceptance-test helper: diff against a previously published report
 # ---------------------------------------------------------------------------
+
+def find_old_matrix(old_report, old_key):
+    """Finds `old_key` (e.g. 'test_dice_matrix') in a previously published
+    report, trying two shapes: a flat top-level key (this module's own
+    report_v2.json schema), or nested inside rounds[<round_idx>] (the live
+    training-loop's metrics.json schema, which never has it at the top
+    level). Returns the raw matrix (list-of-rows or dict), or None if
+    neither shape has it anywhere -- the caller (--compare-against) treats
+    None as a hard failure of the mandatory reproduction gate, never as
+    "nothing to compare, carry on"."""
+    old_matrix_raw = old_report.get(old_key)
+    if old_matrix_raw is not None or 'rounds' not in old_report:
+        return old_matrix_raw
+
+    for round_idx in sorted((int(k) for k in old_report['rounds'].keys()), reverse=True):
+        payload = old_report['rounds'][str(round_idx)]
+        if old_key in payload:
+            return payload[old_key]
+    return None
+
 
 def print_diff_and_check(new_matrix, old_matrix, tol=1e-4, label='dice_matrix'):
     print('\n{} diff (new vs old), tolerance {}:'.format(label, tol))
@@ -631,7 +763,34 @@ def main():
 
     per_client_case_results = {}
     per_client_residual_zeroed_results = {}
+    per_client_on_global_test_results = {}
     residual_touch_log = {}
+
+    if args.from_predictions:
+        # No model is loaded in this mode, so no fresh residual-zeroing
+        # assertion runs here -- the evidence must be the one recorded when
+        # --save-predictions originally created these masks (with a real
+        # model, going through zero_residual_with_assertion). Load it rather
+        # than leaving residual_zeroing_log empty, which would make a
+        # from-predictions report indistinguishable from one where zeroing
+        # silently matched nothing.
+        residual_touch_log = load_residual_zeroing_log(args.from_predictions)
+
+    # Built once, reused by every client's own-mask evaluation below AND by
+    # the canonical global model further down -- a DataLoader/fake loader is
+    # freely re-iterable, and building the 50-case loader once instead of 9
+    # times avoids repeatedly re-globbing --data-root for the same files.
+    global_loader = None
+    global_model = None
+    if global_test_file:
+        if args.from_predictions:
+            global_loader = _FakeLoaderFromCaseIds(_read_case_ids_only(global_test_file))
+        else:
+            global_loader = DataLoader(
+                Brats_test(transforms='Compose([NumpyType((np.float32, np.int64)),])', root=args.data_root,
+                           modal='all', test_file=global_test_file, all_=True),
+                batch_size=1, shuffle=False, num_workers=0)
+            global_model = build_global_model(ckpt['global_encoders'], ckpt['global_decoder_prior'])
 
     for c in range(client_num):
         model = None
@@ -657,28 +816,36 @@ def main():
             'client_{}_residual_zeroed'.format(c), residual_zeroed_model, masks[c], loader, device, policy,
             args.nifti_root, args.save_predictions, args.from_predictions)
 
-    # Canonical global model, scored on the 50-case held-out global test set,
-    # with all four modalities (every case has all four in the data).
+        # Each client's own personalised model, additionally scored on the
+        # SAME shared 50-case held-out set every other client and the global
+        # model are scored on (using this client's own mask, not full
+        # modalities -- this is "how does this client's actual deployed
+        # model perform on unseen shared patients", not a hypothetical
+        # full-modality variant of it). Without this, every client's Dice is
+        # only ever measured on its own ~6-case partition, and per-case
+        # paired comparisons (e.g. Wilcoxon between two clients) are
+        # impossible since no two clients share any evaluated cases at all.
+        if global_loader is not None:
+            per_client_on_global_test_results[c] = score_case_list(
+                'client_{}_on_global_test'.format(c), model, masks[c], global_loader, device, policy,
+                args.nifti_root, args.save_predictions, args.from_predictions)
+
+    # Canonical global model, scored on the same 50-case held-out set, with
+    # all four modalities (every case has all four in the data).
     global_model_case_results = []
-    if global_test_file:
-        if args.from_predictions:
-            case_ids = _read_case_ids_only(global_test_file)
-            global_loader = _FakeLoaderFromCaseIds(case_ids)
-            global_model = None
-        else:
-            global_model = build_global_model(ckpt['global_encoders'], ckpt['global_decoder_prior'])
-            global_loader = DataLoader(
-                Brats_test(transforms='Compose([NumpyType((np.float32, np.int64)),])', root=args.data_root,
-                           modal='all', test_file=global_test_file, all_=True),
-                batch_size=1, shuffle=False, num_workers=0)
+    if global_loader is not None:
         global_model_case_results = score_case_list(
             'global_model', global_model, [True, True, True, True], global_loader, device, policy,
             args.nifti_root, args.save_predictions, args.from_predictions)
 
+    if not args.from_predictions and args.save_predictions:
+        save_residual_zeroing_log(args.save_predictions, residual_touch_log)
+
     report, per_case_records = assemble_report(
         args, policy, masks, client_modalities, rounds,
         per_client_case_results, per_client_residual_zeroed_results,
-        global_model_case_results, round_selection, wall_clock_seconds=time.time() - start_time)
+        global_model_case_results, round_selection, wall_clock_seconds=time.time() - start_time,
+        per_client_on_global_test_results=per_client_on_global_test_results)
     report['split_metadata'] = split_metadata
     report['residual_zeroing_log'] = residual_touch_log
 
@@ -689,10 +856,14 @@ def main():
     with open(args.out, 'w') as f:
         json.dump(report, f, indent=2)
 
-    per_case_csv_path = os.path.join(os.path.dirname(os.path.abspath(args.out)), 'per_case_metrics.csv')
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    per_case_parquet_path = os.path.join(out_dir, 'per_case_metrics.parquet')
+    write_per_case_parquet(per_case_parquet_path, per_case_records)
+    per_case_csv_path = os.path.join(out_dir, 'per_case_metrics.csv')
     write_per_case_csv(per_case_csv_path, per_case_records)
 
     print('Wrote {}'.format(args.out))
+    print('Wrote {}'.format(per_case_parquet_path))
     print('Wrote {}'.format(per_case_csv_path))
 
     if args.compare_against:
@@ -701,29 +872,22 @@ def main():
         old_key = 'test_dice_matrix' if args.partition == 'test' else 'validation_dice_matrix'
         new_key = schema.partitioned_key('dice_matrix', args.partition)
 
-        old_matrix_raw = old_report.get(old_key)
-        if old_matrix_raw is None and 'rounds' in old_report:
-            # The live training-loop's metrics.json (schema v1) nests every
-            # matrix inside rounds[<round_idx>], keyed by that round's payload
-            # -- not at the top level. Find the matrix in the last round that
-            # actually has it (test_dice_matrix is only ever written once, at
-            # the final round; this also works for validation_dice_matrix,
-            # which every evaluated round carries).
-            for round_idx in sorted((int(k) for k in old_report['rounds'].keys()), reverse=True):
-                payload = old_report['rounds'][str(round_idx)]
-                if old_key in payload:
-                    old_matrix_raw = payload[old_key]
-                    break
-
+        old_matrix_raw = find_old_matrix(old_report, old_key)
         if old_matrix_raw is None:
-            print('WARNING: {} has no {} at its top level or inside any rounds[*] entry -- '
-                  'nothing to compare against'.format(args.compare_against, old_key))
-        else:
-            old_matrix = {i: row for i, row in enumerate(old_matrix_raw)} \
-                if isinstance(old_matrix_raw, list) else old_matrix_raw
-            ok = print_diff_and_check(report[new_key], old_matrix, tol=args.compare_tolerance, label=new_key)
-            if not ok:
-                sys.exit(1)
+            # --compare-against is a mandatory reproduction gate, not an
+            # advisory check: if the caller asked for a comparison and no
+            # baseline can be found to compare against, that is a failure of
+            # the gate itself, not something to warn about and continue past.
+            print('ERROR: {} has no {} at its top level or inside any rounds[*] entry -- '
+                  'cannot perform the mandatory reproduction check.'.format(args.compare_against, old_key),
+                  file=sys.stderr)
+            sys.exit(1)
+
+        old_matrix = {i: row for i, row in enumerate(old_matrix_raw)} \
+            if isinstance(old_matrix_raw, list) else old_matrix_raw
+        ok = print_diff_and_check(report[new_key], old_matrix, tol=args.compare_tolerance, label=new_key)
+        if not ok:
+            sys.exit(1)
 
 
 def _read_case_ids_only(path):

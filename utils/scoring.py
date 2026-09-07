@@ -106,13 +106,18 @@ def apply_region_postproc(mask, method, min_component_voxels=50):
         return mask
 
     labeled, num_components = ndimage.label(mask)
-    if num_components <= 1:
-        return mask
-    sizes = ndimage.sum(mask, labeled, index=np.arange(1, num_components + 1))
 
     if method == 'largest_cc':
+        # With <=1 component, "keep only the largest" is a no-op regardless
+        # of that component's size -- this short-circuit is only valid for
+        # largest_cc, never for size_filter (see below: a single component
+        # below min_component_voxels must still be dropped).
+        if num_components <= 1:
+            return mask
+        sizes = ndimage.sum(mask, labeled, index=np.arange(1, num_components + 1))
         keep_labels = [int(np.argmax(sizes)) + 1]
     else:  # size_filter
+        sizes = ndimage.sum(mask, labeled, index=np.arange(1, num_components + 1))
         keep_labels = [i + 1 for i, size in enumerate(sizes) if size >= min_component_voxels]
 
     if not keep_labels:
@@ -319,10 +324,27 @@ def score(pred, gt, spacing_mm, policy):
             'specificity_postproc': specificity_postproc,
             'nsd_raw': nsd_raw,
             'nsd_postproc': nsd_postproc,
+            # 'edge_counts' is kept as an alias of the raw tag for backward
+            # compatibility; 'edge_counts_raw'/'edge_counts_postproc' are the
+            # two real, distinct series -- post-processing can change which
+            # cases are empty/mismatched (e.g. et_volume_threshold zeroing a
+            # small ET prediction turns a 'normal' case into 'mismatch_empty'
+            # or 'both_empty'), so raw-only edge counts cannot answer
+            # questions about the post-processed distribution at all.
             'edge_counts': {
                 'both_empty': int(edge_raw_tag == 'both_empty'),
                 'mismatch_empty': int(edge_raw_tag == 'mismatch_empty'),
                 'normal': int(edge_raw_tag == 'normal'),
+            },
+            'edge_counts_raw': {
+                'both_empty': int(edge_raw_tag == 'both_empty'),
+                'mismatch_empty': int(edge_raw_tag == 'mismatch_empty'),
+                'normal': int(edge_raw_tag == 'normal'),
+            },
+            'edge_counts_postproc': {
+                'both_empty': int(edge_postproc_tag == 'both_empty'),
+                'mismatch_empty': int(edge_postproc_tag == 'mismatch_empty'),
+                'normal': int(edge_postproc_tag == 'normal'),
             },
         }
     return result
@@ -424,6 +446,26 @@ if __name__ == '__main__':
     assert int(largest_only.sum()) < int(filtered.sum()), \
         'largest_cc must collapse to one component -- size_filter must not'
     print('apply_region_postproc size_filter (multi-component): OK')
+
+    # Regression test: a SINGLE component below min_component_voxels must
+    # still be dropped by size_filter. The num_components<=1 short-circuit
+    # is only valid for largest_cc (keeping "the largest" of one component is
+    # a no-op regardless of its size); size_filter must always check every
+    # component's size, including when there's exactly one.
+    single_small = np.zeros(shape, dtype=bool)
+    single_small[0, 0, 0] = True
+    filtered_single_small = apply_region_postproc(single_small, 'size_filter', min_component_voxels=50)
+    assert not filtered_single_small.any(), \
+        'size_filter must drop a lone component below min_component_voxels, not keep it'
+    single_large = make_blob(shape, (10, 10, 10), 5)  # single component, well above 50 voxels
+    assert int(single_large.sum()) >= 50
+    filtered_single_large = apply_region_postproc(single_large, 'size_filter', min_component_voxels=50)
+    assert np.array_equal(filtered_single_large, single_large), \
+        'size_filter must keep a lone component at/above min_component_voxels'
+    # largest_cc's no-op short-circuit for a single component is still correct
+    # regardless of size (keeping "the largest of one" is that one, always).
+    assert np.array_equal(apply_region_postproc(single_small, 'largest_cc'), single_small)
+    print('apply_region_postproc size_filter single-component (regression): OK')
 
     # invalid method
     try:
@@ -576,10 +618,36 @@ if __name__ == '__main__':
     for key in ('dice_raw', 'dice_postproc', 'hd95_raw', 'hd95_postproc',
                 'hd95_raw_valid_pairs_only', 'hd95_postproc_valid_pairs_only',
                 'sensitivity_raw', 'specificity_raw', 'sensitivity_postproc', 'specificity_postproc',
-                'nsd_raw', 'nsd_postproc', 'edge_counts'):
+                'nsd_raw', 'nsd_postproc', 'edge_counts', 'edge_counts_raw', 'edge_counts_postproc'):
         assert key in et_entry, 'missing key {!r} in score() output'.format(key)
     assert set(et_entry['nsd_raw'].keys()) == {str(t) for t in DEFAULT_POLICY['nsd_tolerances_mm']}
     assert sum(et_entry['edge_counts'].values()) == 1
+    assert et_entry['edge_counts'] == et_entry['edge_counts_raw'], \
+        'edge_counts must remain an alias of edge_counts_raw for backward compatibility'
     print('score(): output structure sanity: OK')
+
+    # --- score(): edge_counts_postproc must actually diverge from _raw when
+    # post-processing changes whether a case is empty -- a small ET
+    # prediction that overlaps the GT (a 'normal' raw case) gets zeroed by
+    # et_volume_threshold, becoming a post-processed 'mismatch_empty' case.
+    # Regression test for exactly this: edge_counts_postproc must be tracked
+    # separately from edge_counts_raw, not silently collapsed to the raw tag.
+    small_shape = (30, 30, 30)
+    gt_small_et = np.zeros(small_shape, dtype=np.int64)
+    gt_small_et[10:14, 10:14, 10:14] = 3  # 64-voxel ET region
+    pred_small_et = np.zeros(small_shape, dtype=np.int64)
+    pred_small_et[10:12, 10:12, 10:12] = 3  # 8-voxel ET prediction, overlaps GT, well under the 500-voxel threshold
+
+    result_small = score(pred_small_et, gt_small_et, spacing, DEFAULT_POLICY)
+    et_small = result_small['ET']
+    assert et_small['edge_counts_raw']['normal'] == 1, \
+        'raw ET should be a normal (non-empty, non-empty) case before thresholding'
+    assert et_small['edge_counts_postproc']['mismatch_empty'] == 1, \
+        'et_volume_threshold should zero the 8-voxel prediction, turning it into a mismatch_empty case'
+    assert et_small['edge_counts_postproc'] != et_small['edge_counts_raw'], \
+        'edge_counts_postproc must diverge from edge_counts_raw here, not mirror it'
+    assert et_small['dice_postproc'] < et_small['dice_raw'], \
+        'the now-empty post-processed prediction should score strictly worse than the raw overlap'
+    print('score(): edge_counts_postproc diverges from edge_counts_raw when postproc changes emptiness: OK')
 
     print('ALL TESTS PASSED')
