@@ -27,6 +27,11 @@ def args_parser():
     parser.add_argument('--start_round', type=int, default=0, help="round to resume training from")
     parser.add_argument('--local_ep', type=int, default=1, help="number of local epochs per round")
     parser.add_argument('--client_num', type=int, default=4, help="number of federated clients")
+    parser.add_argument('--clients_per_round', type=int, default=None,
+                         help='K of --client_num clients sampled uniformly at random (without replacement) each '
+                              'round; default (unset) is full participation (K == --client_num), matching prior '
+                              'behaviour exactly. Selection uses a dedicated RNG stream seeded from --seed, '
+                              'independent of data-loader/augmentation randomness.')
     parser.add_argument('--eval', type=int, default=10, help="evaluate every N rounds")
     parser.add_argument('--lam_sd', default=0.1, type=float, help='weight of the modality-dropout self-distillation loss')
 

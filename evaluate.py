@@ -597,13 +597,15 @@ def assemble_report(args, policy, masks, client_modalities, rounds,
 
 def to_jsonable(obj):
     """Recursively converts numpy/torch scalars to plain JSON-safe Python,
-    and normalises any non-finite float (e.g. encoder_coverage's
-    effective_horizon == float('inf') for a modality that is never idle) to
-    None. report_schema.validate_report() treats every field as either a
-    finite number or an explicit "not applicable" None -- there is no JSON
-    representation of infinity, so "unbounded" and "undefined" both become
-    None at this boundary; the raw float('inf') is still what every module
-    computes and returns internally, this only affects what gets written to
+    and normalises any non-finite float to None as a general safety net
+    (nothing currently produced by this pipeline is expected to be
+    non-finite -- encoder_coverage's effective_horizon = T * (1 -
+    idle_fraction) is always a finite number -- but a NaN/Inf slipping in
+    anywhere must never silently reach the JSON output). report_schema.
+    validate_report() treats every field as either a finite number or an
+    explicit "not applicable" None -- there is no JSON representation of
+    infinity, so any non-finite value becomes None at this boundary; this
+    only affects what gets written to
     disk."""
     if isinstance(obj, dict):
         return {str(k): to_jsonable(v) for k, v in obj.items()}
@@ -734,6 +736,21 @@ def main():
     set_determinism(args.seed)
 
     policy = scoring.load_policy(args.policy)
+    # Print the RESOLVED policy -- the actual dict that will be passed into
+    # every score() call -- not just the path to the file on disk. This is
+    # the single fastest way to tell "the legacy/none policy was used
+    # (correct, no bug)" apart from "the postproc branch never fired (bug)":
+    # if this print ever shows method: none for every region, dice_postproc
+    # == dice_raw is the CORRECT, expected result, not a defect.
+    print('Resolved postproc policy (--policy {}):'.format(args.policy))
+    print(json.dumps(policy['postproc'], indent=2))
+    active_methods = {region: policy['postproc'][region]['method'] for region in scoring.REGIONS}
+    if all(m == 'none' for m in active_methods.values()):
+        print('All three regions resolve to method=none: dice_postproc == dice_raw is EXPECTED here, not a bug.')
+    else:
+        print('At least one region has an active method {} -- dice_postproc should differ from '
+              'dice_raw whenever that region\'s post-processing has anything to do.'.format(active_methods))
+
     masks, train_files, validation_files, test_files, global_test_file, split_metadata = load_materialized_split(
         args.manifest, client_num=8, data_seed=args.data_seed)
     client_num = len(masks)

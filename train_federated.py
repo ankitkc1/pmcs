@@ -74,8 +74,25 @@ def self_cuda(obj, device):
 
 
 def select_clients(round, state):
-  
-    return list(range(state['client_num']))
+    """Sample state['clients_per_round'] of state['client_num'] clients
+    uniformly at random, without replacement, using state['participation_rng']
+    -- a dedicated random.Random instance seeded once from --seed at the
+    start of training, never the global `random` module. This keeps client
+    selection reproducible on its own and immune to (and never a source of
+    interference with) the data-loader/augmentation randomness that local
+    training also draws from the global `random` module for (e.g. the
+    modality-dropout self-distillation's random.choice(present_idx)).
+
+    Returned indices are always sorted. This is what guarantees exact
+    backward compatibility at clients_per_round == client_num: sampling ALL
+    N clients without replacement and sorting the result is list(range(N))
+    regardless of the RNG's internal state, so full participation behaves
+    identically to the pre-partial-participation code, byte for byte.
+    """
+    n = state['client_num']
+    k = state.get('clients_per_round', n)
+    rng = state['participation_rng']
+    return sorted(rng.sample(range(n), k))
 
 
 def local_training(args, device, mask, dataloader, model, client_idx, round, optimizer):
@@ -265,13 +282,22 @@ def aggregate_decoder(local_decoders, active_clients):
 ENCODER_ATTRS = ['flair_encoder', 't1ce_encoder', 't1_encoder', 't2_encoder']
 
 
-def broadcast_weights(model_clients, global_encoders, global_decoder_prior, masks):
+def broadcast_weights(model_clients, global_encoders, global_decoder_prior, masks, active_clients):
     """Send client k only the global encoders for modalities in its mask,
     plus A0 and the decoder -- never an encoder for a modality it doesn't
     hold (that client never trains it, so shipping it is wasted bandwidth),
     and never the private residual (R_k), which is absent from
-    global_decoder_prior and therefore left untouched either way."""
-    for m, mask in zip(model_clients, masks):
+    global_decoder_prior and therefore left untouched either way.
+
+    Only clients in `active_clients` are touched at all. A client that sat
+    out this round downloads nothing -- its entire local state (encoders,
+    decoder, and especially its private residual, which this function never
+    writes to for ANY client) is left completely untouched until it is
+    selected again in some future round.
+    """
+    for c in active_clients:
+        m = model_clients[c]
+        mask = masks[c]
         for held, attr, state in zip(mask, ENCODER_ATTRS, global_encoders):
             if held:
                 getattr(m, attr).load_state_dict(state)
@@ -357,9 +383,19 @@ if __name__ == '__main__':
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     args.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     args.local_devices = []
-    args.num_devices = torch.cuda.device_count()
-    for i in range(args.client_num):
-        args.local_devices.append(torch.device('cuda:{}'.format(i%4))) # use 4 gpus
+    if torch.cuda.is_available():
+        args.num_devices = torch.cuda.device_count()
+        for i in range(args.client_num):
+            args.local_devices.append(torch.device('cuda:{}'.format(i % 4)))  # use 4 gpus
+    else:
+        # CPU-only fallback (e.g. a smoke test on a dev machine): one
+        # "device" (the only CPU), used identically by the same
+        # branch/pool dispatch logic below -- this only changes anything
+        # when no CUDA device exists at all, so real GPU runs are
+        # byte-for-byte unaffected.
+        args.num_devices = 1
+        for i in range(args.client_num):
+            args.local_devices.append(torch.device('cpu'))
 
     ########## setting model
     client_model = FusionSegNet(num_cls=args.num_class)
@@ -482,8 +518,20 @@ if __name__ == '__main__':
                         client_model.t1_encoder.state_dict(), client_model.t2_encoder.state_dict()]
     global_decoder_prior = collections.OrderedDict(
         (k, v) for k, v in client_model.fusion_decoder.state_dict().items() if not k.endswith('_residual'))
+    if args.clients_per_round is None:
+        args.clients_per_round = args.client_num
+    if not (1 <= args.clients_per_round <= args.client_num):
+        raise ValueError('--clients_per_round must be between 1 and --client_num ({}), got {}'.format(
+            args.client_num, args.clients_per_round))
+
     agg_state = {
         'client_num': args.client_num,
+        'clients_per_round': args.clients_per_round,
+        # Dedicated RNG stream for participation selection only -- never the
+        # global `random` module, which local_training's modality-dropout
+        # self-distillation already draws from (random.choice(present_idx)).
+        # Seeded from --seed so selection is reproducible on its own.
+        'participation_rng': random.Random(args.seed),
         'update_count': [0, 0, 0, 0],
         'staleness': [0, 0, 0, 0],
     }
@@ -512,6 +560,15 @@ if __name__ == '__main__':
         global_encoders = ckpt['global_encoders']
         global_decoder_prior = ckpt['global_decoder_prior']
         agg_state = ckpt['agg_state']
+        # Backward compatibility: a checkpoint saved before partial
+        # participation existed has no clients_per_round/participation_rng_state
+        # in its agg_state -- backfill full participation so resuming an old
+        # run behaves exactly as it always did.
+        agg_state.setdefault('clients_per_round', args.client_num)
+        rng_state = agg_state.pop('participation_rng_state', None)
+        agg_state['participation_rng'] = random.Random(args.seed)
+        if rng_state is not None:
+            agg_state['participation_rng'].setstate(rng_state)
         best_dices = ckpt['best_dices']
         best_rounds = ckpt.get('best_rounds', [-1] * args.client_num)
 
@@ -531,6 +588,11 @@ if __name__ == '__main__':
 
         active_clients = select_clients(round, agg_state)
         logging.info('\n | Federated Round : {} | active clients: {} |'.format(round, [c+1 for c in active_clients]))
+        # Persisted every round (not just eval rounds), same reasoning as
+        # contributor_counts below: flush() writes the whole in-memory
+        # self.rounds dict each time, so this reaches disk at the next flush
+        # regardless of which round it happened on.
+        metrics_recorder.record_round(round, {'selected_clients': active_clients})
 
         ##### local training (parallel across available GPUs)
         local_encoders = {}
@@ -593,7 +655,7 @@ if __name__ == '__main__':
         # regardless of which round it happened on.
         metrics_recorder.record_round(round, {'contributor_counts': contributor_counts})
 
-        broadcast_weights(model_clients, global_encoders, global_decoder_prior, masks)
+        broadcast_weights(model_clients, global_encoders, global_decoder_prior, masks, active_clients)
 
         # Only clients selected this round are counted as having downloaded
         # anything -- at full participation this is every client, but a
@@ -888,11 +950,39 @@ if __name__ == '__main__':
                     coverage_tracker, encoder_pool_sizes, total_clients=args.client_num,
                     participation_k=len(active_clients)))
 
+                # Same "recompute fresh from metrics_recorder.rounds every
+                # flush" reasoning as encoder_coverage above.
+                selected_by_round = {
+                    r: payload['selected_clients']
+                    for r, payload in metrics_recorder.rounds.items()
+                    if 'selected_clients' in payload
+                }
+                rounds_participated = {
+                    c: sum(1 for selected in selected_by_round.values() if c in selected)
+                    for c in range(args.client_num)
+                }
+                metrics_recorder.set_static('participation', {
+                    'K': args.clients_per_round,
+                    'N': args.client_num,
+                    'selected_by_round': selected_by_round,
+                    'rounds_participated': rounds_participated,
+                })
+
                 metrics_recorder.record_round(round, round_payload)
                 metrics_recorder.flush()
 
         logging.info('*'*10+'FL train a round total time: {:.4f} hours'.format((time.time() - start)/3600)+'*'*10)
         if should_evaluate:
+            # random.Random is not on torch.load's weights_only-safe allowlist
+            # (PyTorch >=2.6 defaults weights_only=True, and this codebase's
+            # own resume call above passes no override) -- save only the
+            # plain getstate() tuple, never the live RNG object, so resume
+            # keeps working regardless of which torch version this actually
+            # runs under.
+            saved_agg_state = dict(agg_state)
+            saved_agg_state['participation_rng_state'] = agg_state['participation_rng'].getstate()
+            del saved_agg_state['participation_rng']
+
             torch.save({
 
             'round': round + 1,
@@ -902,7 +992,7 @@ if __name__ == '__main__':
 
             'global_encoders': global_encoders,
             'global_decoder_prior': global_decoder_prior,
-            'agg_state': agg_state,
+            'agg_state': saved_agg_state,
 
             'best_dices': best_dices,
             'best_rounds': best_rounds,

@@ -115,7 +115,12 @@ def summarize(tracker, pool_sizes, total_clients, participation_k):
         contributors = [u['n_contributors'] for u in updates]
         mean_staleness = sum(stalenesses) / len(stalenesses) if stalenesses else 0.0
         max_staleness = max(stalenesses) if stalenesses else 0
-        effective_horizon = (1.0 / idle_fraction) if idle_fraction > 0 else float('inf')
+        # T * (1 - idle_fraction): how many of the T observed rounds this
+        # modality's encoder actually received a real update in (a finite
+        # number always, including 0.0 when total_rounds is 0) -- this is
+        # numerically identical to update_count, exposed under this name for
+        # report-schema consistency with the partial-participation spec.
+        effective_horizon = total_rounds * (1.0 - idle_fraction)
         mean_contributors = sum(contributors) / len(contributors) if contributors else 0.0
 
         per_modality[m] = {
@@ -124,11 +129,6 @@ def summarize(tracker, pool_sizes, total_clients, participation_k):
             'idle_fraction': idle_fraction,
             'mean_staleness': mean_staleness,
             'max_staleness': max_staleness,
-            # Geometric-distribution intuition: if a modality is idle with
-            # per-round probability p = idle_fraction, the expected number
-            # of rounds you'd wait between fresh updates is 1/p (mean of a
-            # geometric distribution). Undefined (infinite wait) when the
-            # modality is never idle, i.e. p == 0.
             'effective_horizon': effective_horizon,
             'mean_contributors': mean_contributors,
             'pool_size': pool_sizes[m],
@@ -181,7 +181,11 @@ if __name__ == '__main__':
             )
             assert stats['mean_staleness'] == 0.0
             assert stats['max_staleness'] == 0
-            assert stats['effective_horizon'] == float('inf')
+            # effective_horizon = T * (1 - idle_fraction); at idle_fraction
+            # == 0.0 over 150 observed rounds this is exactly 150.0 (every
+            # round was a real update), and always equals update_count.
+            assert stats['effective_horizon'] == 150.0, stats['effective_horizon']
+            assert stats['effective_horizon'] == float(stats['update_count'])
             assert summary['predicted_idle_fraction'][m] == 0.0
 
     # --- Case 2: synthetic 5-round run at K=3, N=8, n_m=2 -----------------
@@ -203,6 +207,20 @@ if __name__ == '__main__':
         assert rec['staleness'] == expected_staleness[r], (r, rec)
         assert rec['was_updated'] == expected_was_updated[r], (r, rec)
         assert rec['n_contributors'] == flair_contributors_by_round[r]
+
+    # effective_horizon = T * (1 - idle_fraction) on this same 5-round run:
+    # FLAIR was idle in rounds 0,1,3 (3 idle rounds) and updated in 2,4 (2
+    # updates) out of 5 -- idle_fraction = 3/5 = 0.6, so
+    # effective_horizon = 5 * (1 - 0.6) = 2.0, exactly equal to update_count.
+    summary2 = summarize(tracker2, pool_sizes={'FLAIR': 2, 'T1ce': 3, 'T1': 3, 'T2': 3},
+                          total_clients=8, participation_k=3)
+    flair_stats = summary2['per_modality']['FLAIR']
+    assert flair_stats['update_count'] == 2
+    assert flair_stats['idle_rounds'] == 3
+    assert abs(flair_stats['idle_fraction'] - 0.6) < 1e-12
+    assert abs(flair_stats['effective_horizon'] - 2.0) < 1e-12
+    assert flair_stats['effective_horizon'] == float(flair_stats['update_count'])
+    print('summarize(): effective_horizon = T*(1-idle_fraction) matches update_count under partial idle: OK')
 
     pred = predicted_idle_fraction(8, 2, 3)
     mc = monte_carlo_idle_fraction(8, 2, 3, num_trials=50000, seed=0)

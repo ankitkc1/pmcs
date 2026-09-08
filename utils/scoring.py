@@ -650,4 +650,44 @@ if __name__ == '__main__':
         'the now-empty post-processed prediction should score strictly worse than the raw overlap'
     print('score(): edge_counts_postproc diverges from edge_counts_raw when postproc changes emptiness: OK')
 
+    # --- Regression test: a REAL-SCALE (240x240x155) case with a dense
+    # scatter of false-positive components, scored with DEFAULT_POLICY's
+    # actual largest_cc/size_filter methods, must show postproc materially
+    # differing from raw for BOTH dice and HD95 in every region. This is the
+    # exact end-to-end shape of the original defect this whole module exists
+    # to fix (raw HD95 in the tens of mm collapsing to near-zero once
+    # scattered false positives are filtered out); a silent no-op in the
+    # postproc branch anywhere in the pipeline would make this test fail.
+    real_scale_shape = (240, 240, 155)
+    gt_real = np.zeros(real_scale_shape, dtype=np.int64)
+    cz, cy, cx = 120, 120, 77
+    zz, yy, xx = np.ogrid[:240, :240, :155]
+    dist2 = (zz - cz) ** 2 + (yy - cy) ** 2 + (xx - cx) ** 2
+    gt_real[dist2 <= 20 ** 2] = 2
+    gt_real[dist2 <= 14 ** 2] = 3
+    gt_real[dist2 <= 9 ** 2] = 1
+
+    pred_real = gt_real.copy()
+    rng_real = np.random.RandomState(1)
+    placed = 0
+    while placed < 3000:
+        z, y, x = rng_real.randint(0, 240), rng_real.randint(0, 240), rng_real.randint(0, 155)
+        if dist2[z, y, x] > 40 ** 2:  # well outside the true tumour
+            pred_real[z, y, x] = rng_real.choice([1, 2, 3])
+            placed += 1
+
+    result_real = score(pred_real, gt_real, (1.0, 1.0, 1.0), DEFAULT_POLICY)
+    for region in REGIONS:
+        entry = result_real[region]
+        assert entry['dice_postproc'] > entry['dice_raw'], (
+            'region {}: postproc dice ({}) should exceed raw dice ({}) once scattered false '
+            'positives are filtered out -- got no improvement, the postproc branch may be dead'
+            .format(region, entry['dice_postproc'], entry['dice_raw']))
+        assert entry['hd95_postproc'] < entry['hd95_raw'] * 0.5, (
+            'region {}: postproc HD95 ({}) should collapse well below raw HD95 ({}) once the '
+            'scattered false positives are removed -- got no material improvement, the postproc '
+            'branch may be dead'.format(region, entry['hd95_postproc'], entry['hd95_raw']))
+    print('score(): real-scale scattered-FP case shows postproc materially improving both dice '
+          'and HD95 under the real DEFAULT_POLICY methods (largest_cc/size_filter): OK')
+
     print('ALL TESTS PASSED')
