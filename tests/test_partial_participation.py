@@ -10,6 +10,7 @@ import copy
 import os
 import random
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -18,6 +19,7 @@ import torch
 import train_federated as tf
 from models.fusion_net import FusionSegNet
 from utils import encoder_coverage as coverage_mod
+from utils import metrics as fedmetrics
 
 # Split A's registered mask design (FLAIR=7, T1ce=2, T1=5, T2=4 pool sizes).
 SPLIT_A_MASKS = [
@@ -259,6 +261,76 @@ def test_c3_non_selected_client_untouched():
     print('C3 / B2 (non-selected client, incl. private residual, untouched): PASS')
 
 
+def test_reselected_client_is_synchronized_without_losing_residual():
+    """A returning client starts local training from current shared weights."""
+    torch.manual_seed(3)
+    client = FusionSegNet(num_cls=4)
+    server = FusionSegNet(num_cls=4)
+    mask = [[True, False, True, True]]
+
+    with torch.no_grad():
+        for parameter in server.parameters():
+            parameter.add_(1.0)
+        for name, parameter in client.named_parameters():
+            if name.endswith('_residual'):
+                parameter.add_(torch.randn_like(parameter) + 0.25)
+
+    stale_missing_encoder = copy.deepcopy(client.t1ce_encoder.state_dict())
+    residual_before = {
+        name: parameter.detach().clone()
+        for name, parameter in client.named_parameters()
+        if name.endswith('_residual')
+    }
+    global_encoders = [
+        server.flair_encoder.state_dict(), server.t1ce_encoder.state_dict(),
+        server.t1_encoder.state_dict(), server.t2_encoder.state_dict(),
+    ]
+    global_decoder_prior = {
+        key: value for key, value in server.fusion_decoder.state_dict().items()
+        if not key.endswith('_residual')
+    }
+
+    tf.broadcast_weights([client], global_encoders, global_decoder_prior, mask, [0])
+
+    assert _state_dicts_equal(client.flair_encoder.state_dict(), global_encoders[0])
+    assert _state_dicts_equal(client.t1_encoder.state_dict(), global_encoders[2])
+    assert _state_dicts_equal(client.t2_encoder.state_dict(), global_encoders[3])
+    assert _state_dicts_equal(client.t1ce_encoder.state_dict(), stale_missing_encoder)
+    decoder_state = client.fusion_decoder.state_dict()
+    for name, value in global_decoder_prior.items():
+        assert torch.equal(decoder_state[name], value), name
+    for name, value in residual_before.items():
+        assert torch.equal(client.state_dict()[name], value), name
+
+    # The real round records this download before the client's later upload;
+    # transfer-key equality must remain enforced in that protocol order.
+    tracker = fedmetrics.CommTracker(1)
+    tracker.record_download(0, 7, global_encoders, global_decoder_prior, mask[0])
+    tracker.record_upload(
+        0, 7, global_encoders, server.fusion_decoder.state_dict(), mask[0])
+
+    print('reselected client pre-training synchronization: PASS')
+
+
+def test_worker_devices_are_assigned_by_slot():
+    args = SimpleNamespace(
+        num_devices=4,
+        local_devices=[torch.device('cuda:{}'.format(slot)) for slot in range(4)],
+    )
+    # Arbitrary client IDs 0 and 4 can occupy slots 0 and 1 in one branch;
+    # slot-based dispatch must therefore send them to distinct GPUs.
+    assert tf.worker_device(args, 0) == torch.device('cuda:0')
+    assert tf.worker_device(args, 1) == torch.device('cuda:1')
+    try:
+        tf.worker_device(args, 4)
+    except IndexError:
+        pass
+    else:
+        raise AssertionError('out-of-range worker slot was accepted')
+
+    print('worker-slot GPU assignment: PASS')
+
+
 # ---------------------------------------------------------------------------
 # C4: 200-round selection-only coverage convergence (Split A pools, K=2,N=8)
 # ---------------------------------------------------------------------------
@@ -346,6 +418,8 @@ if __name__ == '__main__':
     test_c1_backward_compatibility()
     test_c2_zero_contributor_round()
     test_c3_non_selected_client_untouched()
+    test_reselected_client_is_synchronized_without_losing_residual()
+    test_worker_devices_are_assigned_by_slot()
     test_c4_coverage_convergence()
     test_c5_rounds_participated_sums_to_kt()
     print()

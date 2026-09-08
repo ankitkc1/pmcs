@@ -283,7 +283,9 @@ ENCODER_ATTRS = ['flair_encoder', 't1ce_encoder', 't1_encoder', 't2_encoder']
 
 
 def broadcast_weights(model_clients, global_encoders, global_decoder_prior, masks, active_clients):
-    """Send client k only the global encoders for modalities in its mask,
+    """Synchronize selected clients with the latest shared model state.
+
+    Send client k only the global encoders for modalities in its mask,
     plus A0 and the decoder -- never an encoder for a modality it doesn't
     hold (that client never trains it, so shipping it is wasted bandwidth),
     and never the private residual (R_k), which is absent from
@@ -302,6 +304,19 @@ def broadcast_weights(model_clients, global_encoders, global_decoder_prior, mask
             if held:
                 getattr(m, attr).load_state_dict(state)
         m.fusion_decoder.load_state_dict(global_decoder_prior, strict=False)
+
+
+def worker_device(args, slot):
+    """Return the device owned by this branch's worker slot.
+
+    Client IDs are unrelated to the workers executing a branch: with random
+    participation, clients 0 and 4 can be dispatched together. Assigning a
+    device from the client ID can put both jobs on cuda:0, whereas ``slot`` is
+    unique within the branch and therefore spreads its jobs across devices.
+    """
+    if not 0 <= slot < args.num_devices:
+        raise IndexError('worker slot {} outside [0, {})'.format(slot, args.num_devices))
+    return args.local_devices[slot]
 
 
 def log_round_stats(round, contributor_counts, agg_state, writer=None):
@@ -382,11 +397,12 @@ if __name__ == '__main__':
     ########## setting device and gpus
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     args.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    args.local_devices = []
     if torch.cuda.is_available():
         args.num_devices = torch.cuda.device_count()
-        for i in range(args.client_num):
-            args.local_devices.append(torch.device('cuda:{}'.format(i % 4)))  # use 4 gpus
+        args.local_devices = [
+            torch.device('cuda:{}'.format(slot))
+            for slot in range(args.num_devices)
+        ]
     else:
         # CPU-only fallback (e.g. a smoke test on a dev machine): one
         # "device" (the only CPU), used identically by the same
@@ -394,8 +410,7 @@ if __name__ == '__main__':
         # when no CUDA device exists at all, so real GPU runs are
         # byte-for-byte unaffected.
         args.num_devices = 1
-        for i in range(args.client_num):
-            args.local_devices.append(torch.device('cpu'))
+        args.local_devices = [torch.device('cpu')]
 
     ########## setting model
     client_model = FusionSegNet(num_cls=args.num_class)
@@ -594,6 +609,15 @@ if __name__ == '__main__':
         # regardless of which round it happened on.
         metrics_recorder.record_round(round, {'selected_clients': active_clients})
 
+        ##### synchronize selected clients before local training. A client
+        ##### that sat out previous rounds may have stale shared parameters;
+        ##### broadcast_weights updates only its held global encoders and the
+        ##### decoder prior, leaving its private residual untouched.
+        broadcast_weights(model_clients, global_encoders, global_decoder_prior, masks, active_clients)
+        for client_i in active_clients:
+            metrics_recorder.comm.record_download(
+                client_i, round, global_encoders, global_decoder_prior, masks[client_i])
+
         ##### local training (parallel across available GPUs)
         local_encoders = {}
         local_decoders = {}
@@ -619,7 +643,7 @@ if __name__ == '__main__':
 
                 client_i = active_clients[idx]
 
-                result.append(pool.apply_async(local_training, args=(args, args.local_devices[client_i], masks_torch[client_i], dataloader_clients[client_i], model_clients[client_i], client_i, round, optimizer_clients[client_i], )))
+                result.append(pool.apply_async(local_training, args=(args, worker_device(args, slot), masks_torch[client_i], dataloader_clients[client_i], model_clients[client_i], client_i, round, optimizer_clients[client_i], )))
                 result_client_ids.append(client_i)
 
             pool.close()
@@ -655,16 +679,6 @@ if __name__ == '__main__':
         # regardless of which round it happened on.
         metrics_recorder.record_round(round, {'contributor_counts': contributor_counts})
 
-        broadcast_weights(model_clients, global_encoders, global_decoder_prior, masks, active_clients)
-
-        # Only clients selected this round are counted as having downloaded
-        # anything -- at full participation this is every client, but a
-        # future reduced-participation sweep must not silently bill an idle
-        # client for bytes it never actually received this round.
-        for client_i in active_clients:
-            metrics_recorder.comm.record_download(
-                client_i, round, global_encoders, global_decoder_prior, masks[client_i])
-
         ##### Eval the model after aggregation and every args.eval rounds
         if should_evaluate:
             logging.info('-'*20 + 'Validate all client models'+ '-'*20)
@@ -687,7 +701,7 @@ if __name__ == '__main__':
                         if c >= args.client_num:
                             break
 
-                        results.append(pool.apply_async(local_test, (args, validloader_clients[c], model_clients[c], args.local_devices[c], 'BRATS2020', {}, masks[c],)))
+                        results.append(pool.apply_async(local_test, (args, validloader_clients[c], model_clients[c], worker_device(args, c_), 'BRATS2020', {}, masks[c],)))
 
                     pool.close()
                     pool.join()
@@ -736,8 +750,8 @@ if __name__ == '__main__':
                 if is_final_round:
                     test_results = fedmetrics.run_pooled(
                         args, list(range(args.client_num)), local_test,
-                        lambda c: (args, testloader_clients[c], model_clients[c],
-                                   args.local_devices[c], 'BRATS2020', {}, masks[c]))
+                        lambda c, slot: (args, testloader_clients[c], model_clients[c],
+                                        worker_device(args, slot), 'BRATS2020', {}, masks[c]))
                     test_dice_matrix = [test_results[c] for c in range(args.client_num)]
                     round_payload['test_dice_matrix'] = [
                         list(map(float, test_dice_matrix[c])) for c in range(args.client_num)]
@@ -757,8 +771,9 @@ if __name__ == '__main__':
                 if args.compute_hd95 and is_final_round:
                     hd95_results = fedmetrics.run_pooled(
                         args, list(range(args.client_num)), fedmetrics.evaluate_client,
-                        lambda c: (args, validloader_clients[c], model_clients[c], args.local_devices[c],
-                                   masks[c], True, voxel_spacing, args.postproc, args.min_component_voxels))
+                        lambda c, slot: (args, validloader_clients[c], model_clients[c],
+                                        worker_device(args, slot), masks[c], True, voxel_spacing,
+                                        args.postproc, args.min_component_voxels))
                     hd95_matrix = [hd95_results[c]['hd95'] for c in range(args.client_num)]
                     round_payload['hd95_matrix'] = [list(map(float, v)) for v in hd95_matrix]
                     round_payload['hd95_edge_counts'] = {c: hd95_results[c]['edge_counts'] for c in range(args.client_num)}
@@ -785,9 +800,9 @@ if __name__ == '__main__':
                     if is_final_round:
                         test_hd95_results = fedmetrics.run_pooled(
                             args, list(range(args.client_num)), fedmetrics.evaluate_client,
-                            lambda c: (args, testloader_clients[c], model_clients[c],
-                                       args.local_devices[c], masks[c], True, voxel_spacing,
-                                       args.postproc, args.min_component_voxels))
+                            lambda c, slot: (args, testloader_clients[c], model_clients[c],
+                                            worker_device(args, slot), masks[c], True, voxel_spacing,
+                                            args.postproc, args.min_component_voxels))
                         round_payload['test_hd95_matrix'] = [
                             list(map(float, test_hd95_results[c]['hd95']))
                             for c in range(args.client_num)]
@@ -814,8 +829,8 @@ if __name__ == '__main__':
                     zero_models = {c: fedmetrics.zero_residual_copy(model_clients[c]) for c in range(args.client_num)}
                     pers_results = fedmetrics.run_pooled(
                         args, list(range(args.client_num)), fedmetrics.evaluate_client,
-                        lambda c: (args, validloader_clients[c], zero_models[c], args.local_devices[c],
-                                   masks[c], False, voxel_spacing))
+                        lambda c, slot: (args, validloader_clients[c], zero_models[c],
+                                        worker_device(args, slot), masks[c], False, voxel_spacing))
                     gain_matrix = [dice_matrix[c] - pers_results[c]['dice'] for c in range(args.client_num)]
                     round_payload['personalisation_gain_matrix'] = [list(map(float, v)) for v in gain_matrix]
                     for c in range(args.client_num):
@@ -828,8 +843,8 @@ if __name__ == '__main__':
                             for c in range(args.client_num)}
                         test_pers_results = fedmetrics.run_pooled(
                             args, list(range(args.client_num)), fedmetrics.evaluate_client,
-                            lambda c: (args, testloader_clients[c], test_zero_models[c],
-                                       args.local_devices[c], masks[c], False, voxel_spacing))
+                            lambda c, slot: (args, testloader_clients[c], test_zero_models[c],
+                                            worker_device(args, slot), masks[c], False, voxel_spacing))
                         test_gain_matrix = [
                             test_dice_matrix[c] - test_pers_results[c]['dice']
                             for c in range(args.client_num)]
@@ -865,8 +880,8 @@ if __name__ == '__main__':
                     full_mask = [True, True, True, True]
                     client_ceiling_results = fedmetrics.run_pooled(
                         args, list(range(args.client_num)), fedmetrics.evaluate_client,
-                        lambda c: (args, validloader_clients[c], global_model, args.local_devices[c],
-                                   full_mask, False, voxel_spacing))
+                        lambda c, slot: (args, validloader_clients[c], global_model,
+                                        worker_device(args, slot), full_mask, False, voxel_spacing))
                     client_ceiling = {c: client_ceiling_results[c]['dice'] for c in range(args.client_num)}
                     modality_deficit = {
                         c: (client_ceiling[c] - dice_matrix[c]) for c in range(args.client_num)
@@ -885,8 +900,8 @@ if __name__ == '__main__':
                     if is_final_round:
                         test_client_ceiling_results = fedmetrics.run_pooled(
                             args, list(range(args.client_num)), fedmetrics.evaluate_client,
-                            lambda c: (args, testloader_clients[c], global_model,
-                                       args.local_devices[c], full_mask, False, voxel_spacing))
+                            lambda c, slot: (args, testloader_clients[c], global_model,
+                                            worker_device(args, slot), full_mask, False, voxel_spacing))
                         test_client_ceiling = {
                             c: test_client_ceiling_results[c]['dice'] for c in range(args.client_num)}
                         test_modality_deficit = {

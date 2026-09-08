@@ -281,6 +281,8 @@ def run_pooled(args, client_indices, task_fn, build_args_fn):
     """
     Generic multi-GPU pooled dispatcher, mirroring the branch/pool pattern
     already used for local_training/local_test in train_federated.py.
+    ``build_args_fn`` receives both the client ID and the worker slot so its
+    task can select a device by slot instead of by arbitrary client ID.
     """
     results = {}
     branch_num = len(client_indices) // args.num_devices
@@ -295,7 +297,7 @@ def run_pooled(args, client_indices, task_fn, build_args_fn):
             if idx >= len(client_indices):
                 break
             c = client_indices[idx]
-            pending.append((c, pool.apply_async(task_fn, build_args_fn(c))))
+            pending.append((c, pool.apply_async(task_fn, build_args_fn(c, slot))))
         pool.close()
         pool.join()
         for c, r in pending:
@@ -311,8 +313,10 @@ class CommTracker:
         self.uploaded = {c: {} for c in range(client_num)}
         self.downloaded = {c: {} for c in range(client_num)}
         # Transient, in-memory only (not part of state_dict/resume): the set of
-        # tensor identities moved this round, used to assert download == upload.
+        # tensor identities moved this round, used to assert download == upload
+        # regardless of which side is recorded first.
         self._uploaded_keys = {c: {} for c in range(client_num)}
+        self._downloaded_keys = {c: {} for c in range(client_num)}
 
     def record_upload(self, client_idx, round_idx, encoders, decoder_state, mask):
         """
@@ -337,6 +341,13 @@ class CommTracker:
             'R_k (fusion adapter residual) must never be counted as uploaded'
         self.uploaded[client_idx][round_idx] = int(numel)
         self._uploaded_keys[client_idx][round_idx] = keys
+        downloaded_keys = self._downloaded_keys[client_idx].get(round_idx)
+        if downloaded_keys is not None:
+            assert keys == downloaded_keys, (
+                'client {} round {}: downloaded tensor keys != uploaded tensor keys '
+                '(download-only: {}, upload-only: {})'.format(
+                    client_idx, round_idx,
+                    sorted(downloaded_keys - keys), sorted(keys - downloaded_keys)))
         return int(numel)
 
     def record_download(self, client_idx, round_idx, global_encoders, global_decoder_prior, mask):
@@ -360,6 +371,7 @@ class CommTracker:
             numel += t.numel()
             keys.add(('decoder', k))
 
+        self._downloaded_keys[client_idx][round_idx] = keys
         uploaded_keys = self._uploaded_keys[client_idx].get(round_idx)
         if uploaded_keys is not None:
             assert keys == uploaded_keys, (
