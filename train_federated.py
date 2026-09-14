@@ -27,6 +27,7 @@ from options import args_parser
 from utils.predict import local_test
 from utils import metrics as fedmetrics
 from utils import encoder_coverage as coverage_mod
+from utils.selection import ClientSelector
 
 MODAL_NAMES = ['flair', 't1ce', 't1', 't2']
 
@@ -88,6 +89,14 @@ def select_clients(round, state):
     N clients without replacement and sorting the result is list(range(N))
     regardless of the RNG's internal state, so full participation behaves
     identically to the pre-partial-participation code, byte for byte.
+
+    The production round loop no longer calls this -- it now goes through
+    utils.selection.ClientSelector(policy=..., ...), whose 'uniform' policy
+    reproduces this function exactly (same RNG object, same consumption
+    order/count per round; see tests/test_selection.py's reproduction test,
+    which asserts the two produce an identical 150-round sequence at
+    seed=42, K=2). Kept here, unmodified, as that test's ground truth and
+    because tests/test_partial_participation.py still exercises it directly.
     """
     n = state['client_num']
     k = state.get('clients_per_round', n)
@@ -279,6 +288,22 @@ def aggregate_decoder(local_decoders, active_clients):
     return avg_state
 
 
+def accumulate_agg_weight(cum_agg_weight, masks, active_clients, contributor_counts):
+    """Add this round's real FedAvg weight to each active client's running
+    total: 1/len(active_clients) for the decoder (aggregate_decoder averages
+    every active client equally) plus 1/contributor_counts[m] for every
+    modality m the client holds (avg_EW's per-contributor weight for that
+    modality). Pure bookkeeping over aggregate_encoders/aggregate_decoder's
+    existing outputs -- computes nothing they don't already imply, and feeds
+    back into nothing (never touches global_encoders/global_decoder_prior)."""
+    for c in active_clients:
+        weight = 1.0 / len(active_clients)
+        for m in range(4):
+            if masks[c][m] and contributor_counts[m] > 0:
+                weight += 1.0 / contributor_counts[m]
+        cum_agg_weight[c] += weight
+
+
 ENCODER_ATTRS = ['flair_encoder', 't1ce_encoder', 't1_encoder', 't2_encoder']
 
 
@@ -304,6 +329,78 @@ def broadcast_weights(model_clients, global_encoders, global_decoder_prior, mask
             if held:
                 getattr(m, attr).load_state_dict(state)
         m.fusion_decoder.load_state_dict(global_decoder_prior, strict=False)
+
+
+class SelectionCtx:
+    """What a client-selection policy may need beyond the server's own
+    bookkeeping (see utils.selection.ClientSelector). Built fresh every
+    round; cheap unless a policy actually calls local_loss -- only `poc`
+    does, and only from round 1 onward.
+
+    local_loss() never touches the persistent per-client `model_clients`:
+    every candidate is scored on a throwaway deep copy synced to the current
+    global encoders/decoder, so merely being considered as a PoC candidate
+    (and not ultimately selected) has zero effect on that client's state --
+    in particular, no effect on the NEXT eval round, which scores every
+    client's model_clients[c] regardless of whether it was selected.
+    """
+
+    def __init__(self, args, model_clients, masks, masks_torch, dataloader_clients,
+                 global_encoders, global_decoder_prior, n_samples):
+        self.n_samples = n_samples
+        self._args = args
+        self._model_clients = model_clients
+        self._masks = masks
+        self._masks_torch = masks_torch
+        self._dataloader_clients = dataloader_clients
+        self._global_encoders = global_encoders
+        self._global_decoder_prior = global_decoder_prior
+
+    def local_loss(self, client_ids):
+        """F_k(w_t) for each k in client_ids: one forward pass (no grad, no
+        backward, no optimizer step) of the current global model over one
+        batch of that client's own local training data. Mirrors the
+        deterministic part of local_training()'s teacher-path loss (fuse +
+        prm + sep) exactly, omitting only the modality-dropout
+        self-distillation term (stochastic, and not part of the local
+        empirical loss Power-of-Choice ranks candidates by)."""
+        args = self._args
+        losses = {}
+        for c in client_ids:
+            probe = copy.deepcopy(self._model_clients[c])
+            mask = self._masks_torch[c]
+            for held, attr, state in zip(self._masks[c], ENCODER_ATTRS, self._global_encoders):
+                if held:
+                    getattr(probe, attr).load_state_dict(state)
+            probe.fusion_decoder.load_state_dict(self._global_decoder_prior, strict=False)
+
+            probe = probe.to(args.device)
+            probe.train()
+            probe.is_training = True
+            mask_dev = mask.to(args.device)
+            data = next(iter(self._dataloader_clients[c]))
+            vol_batch, msk_batch = data[0].to(args.device), data[1].to(args.device)
+            msk = torch.unsqueeze(mask_dev, dim=0).repeat(vol_batch.shape[0], 1)
+
+            with torch.no_grad():
+                x1, x2, x3, x4, per_modal = probe.encode(vol_batch)
+                fuse_pred, prm_preds, _, _ = probe.decode(x1, x2, x3, x4, msk)
+
+                loss = (criterions.softmax_weighted_loss(fuse_pred, msk_batch, num_cls=args.num_class)
+                        + criterions.dice_loss(fuse_pred, msk_batch, num_cls=args.num_class))
+                for prm_pred in prm_preds:
+                    loss = loss + criterions.softmax_weighted_loss(prm_pred, msk_batch, num_cls=args.num_class) \
+                                 + criterions.dice_loss(prm_pred, msk_batch, num_cls=args.num_class)
+
+                per_modal_preds = torch.stack([probe.modality_decoder(*feats) for feats in per_modal], dim=0)
+                sep_preds = per_modal_preds[mask_dev, ...]
+                for pi in range(sep_preds.shape[0]):
+                    loss = loss + criterions.softmax_weighted_loss(sep_preds[pi], msk_batch, num_cls=args.num_class) \
+                                 + criterions.dice_loss(sep_preds[pi], msk_batch, num_cls=args.num_class)
+
+            losses[c] = float(loss.item())
+            del probe
+        return losses
 
 
 def worker_device(args, slot):
@@ -334,6 +431,25 @@ def log_round_stats(round, contributor_counts, agg_state, writer=None):
             writer.add_scalar('EncoderAgg/contributors_' + MODAL_NAMES[m], contributor_counts[m], round)
             writer.add_scalar('EncoderAgg/update_count_' + MODAL_NAMES[m], agg_state['update_count'][m], round)
             writer.add_scalar('EncoderAgg/staleness_' + MODAL_NAMES[m], agg_state['staleness'][m], round)
+
+
+def append_selection_log(path, selector, cum_agg_weight):
+    """Append this round's selection record (utils.selection.ClientSelector's
+    own history, which observe() just appended to) plus cum_agg_weight_k --
+    the running real-FedAvg-weight total per client, which the selector
+    itself has no way to know (it never sees contributor_counts) -- as one
+    JSON line. One record per round, every policy, per the logging spec."""
+    stats = selector.stats()
+    record = dict(stats['history'][-1])
+    record['policy'] = stats['policy']
+    record['seed'] = stats['seed']
+    record['K'] = stats['K']
+    record['beta'] = stats['beta']
+    record['s_max'] = stats['s_max']
+    record['d'] = stats['d']
+    record['cum_agg_weight_k'] = dict(cum_agg_weight)
+    with open(path, 'a') as f:
+        f.write(json.dumps(record) + '\n')
 
 
 if __name__ == '__main__':
@@ -490,6 +606,10 @@ if __name__ == '__main__':
         'compute_pers_gain': args.compute_pers_gain, 'eval_global_model': args.eval_global_model,
         'global_test_size': args.global_test_size, 'global_test_seed': args.global_test_seed,
         'postproc': args.postproc, 'min_component_voxels': args.min_component_voxels,
+        # clients_per_round itself is recorded later, after --clients_per_round is
+        # resolved (None -> client_num), in the existing 'participation' static block.
+        'selection_policy': args.selection_policy, 'poc_d': args.poc_d,
+        'mics_beta': args.mics_beta, 'mics_smax': args.mics_smax,
     })
 
     ##### per-modality-encoder coverage instrumentation (Task 6): tracks,
@@ -542,14 +662,45 @@ if __name__ == '__main__':
     agg_state = {
         'client_num': args.client_num,
         'clients_per_round': args.clients_per_round,
-        # Dedicated RNG stream for participation selection only -- never the
-        # global `random` module, which local_training's modality-dropout
-        # self-distillation already draws from (random.choice(present_idx)).
-        # Seeded from --seed so selection is reproducible on its own.
-        'participation_rng': random.Random(args.seed),
         'update_count': [0, 0, 0, 0],
         'staleness': [0, 0, 0, 0],
     }
+
+    ########## pluggable client selection (uniform / poc / mics) ##########
+    # manifest: the same (client_num, 4) modality mask used everywhere else
+    # (masks/masks_torch), just handed to the selector as a plain array --
+    # this is the only new thing the selection site gets to see; the
+    # aggregation/broadcast code paths above are untouched.
+    manifest = np.array(masks, dtype=np.int64)
+    selector_kwargs = {}
+    if args.selection_policy == 'poc':
+        selector_kwargs['d'] = args.poc_d if args.poc_d is not None else 2 * args.clients_per_round
+    elif args.selection_policy == 'mics':
+        selector_kwargs['beta'] = args.mics_beta
+        selector_kwargs['s_max'] = args.mics_smax
+    # ClientSelector owns the one RNG stream `uniform` consumes every round
+    # (and poc/mics touch only at round 0) -- agg_state above deliberately
+    # no longer carries a participation_rng; see select_clients()'s
+    # docstring for why the old function stays put, unused, as the
+    # reproduction test's ground truth.
+    selector = ClientSelector(
+        args.selection_policy, manifest, args.clients_per_round, args.seed, **selector_kwargs)
+
+    client_n_samples = {c: len(dataloader_clients[c].dataset) for c in range(args.client_num)}
+
+    # Cumulative real FedAvg weight mass each client's updates have carried
+    # across all rounds so far: decoder share (1/K, since aggregate_decoder
+    # averages all active clients equally) plus, for every modality this
+    # client holds and that got aggregated this round, its encoder share
+    # (1/contributor_count for that modality, from avg_EW). This is the
+    # thing a selection-only CPU simulator cannot see (it never runs FedAvg),
+    # unlike plain participation counts -- see the module docstring in
+    # utils/selection.py and the paragraph on cum_agg_weight_k in the task.
+    cum_agg_weight = {c: 0.0 for c in range(args.client_num)}
+
+    selection_log_path = os.path.join(args.save_path, 'selection_log.jsonl')
+    if args.resume == 0 and os.path.exists(selection_log_path):
+        os.remove(selection_log_path)
 
     if args.resume != 0:
 
@@ -576,14 +727,29 @@ if __name__ == '__main__':
         global_decoder_prior = ckpt['global_decoder_prior']
         agg_state = ckpt['agg_state']
         # Backward compatibility: a checkpoint saved before partial
-        # participation existed has no clients_per_round/participation_rng_state
-        # in its agg_state -- backfill full participation so resuming an old
-        # run behaves exactly as it always did.
+        # participation existed has no clients_per_round in its agg_state --
+        # backfill full participation so resuming an old run behaves exactly
+        # as it always did.
         agg_state.setdefault('clients_per_round', args.client_num)
-        rng_state = agg_state.pop('participation_rng_state', None)
-        agg_state['participation_rng'] = random.Random(args.seed)
+        # The RNG state selector.rng now owns used to live under agg_state as
+        # 'participation_rng_state' before this refactor; fall back to that
+        # for a checkpoint saved by the pre-selector.py code.
+        rng_state = ckpt.get('selector_rng_state', agg_state.pop('participation_rng_state', None))
         if rng_state is not None:
-            agg_state['participation_rng'].setstate(rng_state)
+            selector.rng.setstate(rng_state)
+        # Rebuild selector's internal updates[]/stale[] (mics) and
+        # cum_agg_weight from the per-round history try_resume() already
+        # loaded into metrics_recorder.rounds, the same idiom as
+        # coverage_tracker's resume rebuild above -- no separate checkpoint
+        # state needed for either.
+        for r in sorted(metrics_recorder.rounds.keys()):
+            payload = metrics_recorder.rounds[r]
+            if 'selected_clients' in payload and 'contributor_counts' in payload:
+                selected = payload['selected_clients']
+                contributor_counts = payload['contributor_counts']
+                aggregated_modalities = [count > 0 for count in contributor_counts]
+                selector.fast_forward(r, selected, aggregated_modalities)
+                accumulate_agg_weight(cum_agg_weight, masks, selected, contributor_counts)
         best_dices = ckpt['best_dices']
         best_rounds = ckpt.get('best_rounds', [-1] * args.client_num)
 
@@ -601,8 +767,12 @@ if __name__ == '__main__':
         is_final_round = completed_round == args.c_rounds
         should_evaluate = (completed_round % args.eval == 0) or is_final_round
 
-        active_clients = select_clients(round, agg_state)
-        logging.info('\n | Federated Round : {} | active clients: {} |'.format(round, [c+1 for c in active_clients]))
+        selection_ctx = SelectionCtx(
+            args, model_clients, masks, masks_torch, dataloader_clients,
+            global_encoders, global_decoder_prior, client_n_samples)
+        active_clients = selector.select(round, selection_ctx)
+        logging.info('\n | Federated Round : {} | active clients: {} | policy: {} |'.format(
+            round, [c+1 for c in active_clients], args.selection_policy))
         # Persisted every round (not just eval rounds), same reasoning as
         # contributor_counts below: flush() writes the whole in-memory
         # self.rounds dict each time, so this reaches disk at the next flush
@@ -670,6 +840,11 @@ if __name__ == '__main__':
         ##### The FusionAdapter's residual half never leaves the client.
         global_encoders, contributor_counts = aggregate_encoders(local_encoders, active_clients, masks_torch, global_encoders)
         global_decoder_prior = aggregate_decoder(local_decoders, active_clients)
+
+        aggregated_modalities = [count > 0 for count in contributor_counts]
+        selector.observe(round, active_clients, aggregated_modalities)
+        accumulate_agg_weight(cum_agg_weight, masks, active_clients, contributor_counts)
+        append_selection_log(selection_log_path, selector, cum_agg_weight)
 
         log_round_stats(round, contributor_counts, agg_state, writer=writer)
         coverage_tracker.record_round(round, contributor_counts)
@@ -993,11 +1168,9 @@ if __name__ == '__main__':
             # own resume call above passes no override) -- save only the
             # plain getstate() tuple, never the live RNG object, so resume
             # keeps working regardless of which torch version this actually
-            # runs under.
-            saved_agg_state = dict(agg_state)
-            saved_agg_state['participation_rng_state'] = agg_state['participation_rng'].getstate()
-            del saved_agg_state['participation_rng']
-
+            # runs under. selector.updates/stale/cum_agg_weight need no
+            # checkpoint entry at all -- resume rebuilds them by replaying
+            # metrics_recorder.rounds (see the resume block above).
             torch.save({
 
             'round': round + 1,
@@ -1007,7 +1180,8 @@ if __name__ == '__main__':
 
             'global_encoders': global_encoders,
             'global_decoder_prior': global_decoder_prior,
-            'agg_state': saved_agg_state,
+            'agg_state': agg_state,
+            'selector_rng_state': selector.rng.getstate(),
 
             'best_dices': best_dices,
             'best_rounds': best_rounds,

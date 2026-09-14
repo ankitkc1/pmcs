@@ -32,6 +32,18 @@ def args_parser():
                               'round; default (unset) is full participation (K == --client_num), matching prior '
                               'behaviour exactly. Selection uses a dedicated RNG stream seeded from --seed, '
                               'independent of data-loader/augmentation randomness.')
+    parser.add_argument('--selection_policy', default='uniform', choices=['uniform', 'poc', 'mics'],
+                         help='client-selection policy applied when --clients_per_round < --client_num: '
+                              'uniform (existing behaviour), poc (Power-of-Choice, Cho et al. AISTATS 2022), '
+                              'or mics (Modality-Informed Client Selection); see utils/selection.py')
+    parser.add_argument('--poc_d', type=int, default=None,
+                         help='poc candidate-set size |A|; default (unset) is 2 * --clients_per_round')
+    parser.add_argument('--mics_beta', type=float, default=0.15,
+                         help='mics fairness-term weight in f(S) = cover(S) + beta * fair(S); default is from '
+                              'an offline CPU sweep (scripts/mics_finalise.py), not tuned per run')
+    parser.add_argument('--mics_smax', type=int, default=12,
+                         help='mics forced-inclusion staleness cap: any client unselected for >= mics_smax '
+                              'rounds is force-included; default is from the same offline CPU sweep')
     parser.add_argument('--eval', type=int, default=10, help="evaluate every N rounds")
     parser.add_argument('--lam_sd', default=0.1, type=float, help='weight of the modality-dropout self-distillation loss')
 
