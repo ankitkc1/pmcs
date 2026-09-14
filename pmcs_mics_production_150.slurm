@@ -1,10 +1,38 @@
+#!/bin/bash
+#SBATCH --job-name=pmcs-mics-150
+#SBATCH --partition=gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:rtxa4000:2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
+#SBATCH --time=24:00:00
+#SBATCH --array=0-11%1
+#SBATCH --output=pmcs-mics-150-%A_%a.out
+#SBATCH --error=pmcs-mics-150-%A_%a.err
+set -euo pipefail
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate pmcs
+cd "$HOME/pmcs"
+EXPECTED_SOURCE_COMMIT="676f5bbe61ee94f66c3174ed0eaaea28e0add784"
+ACTUAL_COMMIT="$(git rev-parse HEAD)"
+git cat-file -e "${EXPECTED_SOURCE_COMMIT}^{commit}" || {
+    echo "ERROR: reviewed source commit is unavailable: $EXPECTED_SOURCE_COMMIT"
+    exit 1
+}
+# HEAD may additionally contain this runner, but the reviewed experiment
+# sources (including staged/unstaged content) must match the audited commit.
+if ! git diff --quiet "$EXPECTED_SOURCE_COMMIT" -- \
+    options.py train_federated.py dataset/datasets.py \
+    utils/selection.py utils/metrics.py utils/encoder_coverage.py \
+    scripts/audit_full_run.py tests/test_selection.py; then
     echo "ERROR: experiment source differs from reviewed commit $EXPECTED_SOURCE_COMMIT"
     git diff --stat "$EXPECTED_SOURCE_COMMIT" -- \
         options.py train_federated.py dataset/datasets.py \
         utils/selection.py utils/metrics.py utils/encoder_coverage.py \
         scripts/audit_full_run.py tests/test_selection.py
     exit 1
-if
+fi
 SPLITS=(A A A A A A B B B B B B)
 KS=(4 4 4 2 2 2 4 4 4 2 2 2)
 SEEDS=(42 123 2026 42 123 2026 42 123 2026 42 123 2026)
@@ -54,49 +82,3 @@ python -u train_federated.py \
     --mics_smax "$S_MAX" \
     --lam_sd 0.1 \
     --compute_hd95 \
-    --compute_pers_gain \
-    --eval_global_model \
-    --version "$VERSION" \
-    --resume 0
-python scripts/audit_full_run.py "$RESULT_DIR" \
-    --split "$SPLIT" --rounds 150 --eval_every 10
-python - "$RESULT_DIR" "$K" "$MODEL_SEED" <<'PY'
-import json
-import math
-import sys
-from pathlib import Path
-result = Path(sys.argv[1])
-expected_k = int(sys.argv[2])
-expected_seed = int(sys.argv[3])
-with (result / "metrics.json").open() as handle:
-    metrics = json.load(handle)
-static = metrics["static"]
-config = static["config"]
-assert config["selection_policy"] == "mics"
-assert int(config["seed"]) == expected_seed
-assert math.isclose(float(config["mics_beta"]), 0.15)
-assert int(config["mics_smax"]) == 12
-participation = static["participation"]
-assert int(participation["K"]) == expected_k
-selected = participation["selected_by_round"]
-assert len(selected) == 150
-assert sorted(map(int, selected)) == list(range(150))
-assert all(len(set(row)) == expected_k for row in selected.values())
-counts = {int(k): int(v) for k, v in participation["rounds_participated"].items()}
-assert sum(counts.values()) == expected_k * 150
-coverage = static["encoder_coverage"]["per_modality"]
-updates = {name: int(row["update_count"]) for name, row in coverage.items()}
-minimum_expected = 145 if expected_k == 2 else 149
-assert min(updates.values()) >= minimum_expected, (updates, minimum_expected)
-with (result / "selection_log.jsonl").open() as handle:
-    records = [json.loads(line) for line in handle if line.strip()]
-assert len(records) == 150
-assert [int(row["round"]) for row in records] == list(range(150))
-assert all(row["policy"] == "mics" for row in records)
-assert all(int(row["K"]) == expected_k for row in records)
-print("MICS POST-FLIGHT PASSED")
-print("Rounds participated:", counts)
-print("Encoder updates:", updates)
-print("Result directory:", result)
-PY
-echo "MICS 150-ROUND TRAINING COMPLETED: split=$SPLIT K=$K seed=$MODEL_SEED"
