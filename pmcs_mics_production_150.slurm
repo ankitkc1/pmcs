@@ -4,7 +4,7 @@
         utils/selection.py utils/metrics.py utils/encoder_coverage.py \
         scripts/audit_full_run.py tests/test_selection.py
     exit 1
-fi
+if
 SPLITS=(A A A A A A B B B B B B)
 KS=(4 4 4 2 2 2 4 4 4 2 2 2)
 SEEDS=(42 123 2026 42 123 2026 42 123 2026 42 123 2026)
