@@ -82,3 +82,59 @@ python -u train_federated.py \
     --mics_smax "$S_MAX" \
     --lam_sd 0.1 \
     --compute_hd95 \
+    --compute_pers_gain \
+    --eval_global_model \
+    --version "$VERSION" \
+    --resume 0
+
+python scripts/audit_full_run.py "$RESULT_DIR" \
+    --split "$SPLIT" --rounds 150 --eval_every 10
+
+python - "$RESULT_DIR" "$K" "$MODEL_SEED" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+result = Path(sys.argv[1])
+expected_k = int(sys.argv[2])
+expected_seed = int(sys.argv[3])
+
+with (result / "metrics.json").open() as handle:
+    metrics = json.load(handle)
+
+static = metrics["static"]
+config = static["config"]
+assert config["selection_policy"] == "mics"
+assert int(config["seed"]) == expected_seed
+assert math.isclose(float(config["mics_beta"]), 0.15)
+assert int(config["mics_smax"]) == 12
+
+participation = static["participation"]
+assert int(participation["K"]) == expected_k
+selected = participation["selected_by_round"]
+assert len(selected) == 150
+assert sorted(map(int, selected)) == list(range(150))
+assert all(len(set(row)) == expected_k for row in selected.values())
+counts = {int(k): int(v) for k, v in participation["rounds_participated"].items()}
+assert sum(counts.values()) == expected_k * 150
+
+coverage = static["encoder_coverage"]["per_modality"]
+updates = {name: int(row["update_count"]) for name, row in coverage.items()}
+minimum_expected = 145 if expected_k == 2 else 149
+assert min(updates.values()) >= minimum_expected, (updates, minimum_expected)
+
+with (result / "selection_log.jsonl").open() as handle:
+    records = [json.loads(line) for line in handle if line.strip()]
+assert len(records) == 150
+assert [int(row["round"]) for row in records] == list(range(150))
+assert all(row["policy"] == "mics" for row in records)
+assert all(int(row["K"]) == expected_k for row in records)
+
+print("MICS POST-FLIGHT PASSED")
+print("Rounds participated:", counts)
+print("Encoder updates:", updates)
+print("Result directory:", result)
+PY
+
+echo "MICS 150-ROUND TRAINING COMPLETED: split=$SPLIT K=$K seed=$MODEL_SEED"

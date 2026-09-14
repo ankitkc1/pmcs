@@ -1,3 +1,31 @@
+#!/bin/bash
+#SBATCH --job-name=pmcs-mics-smoke
+#SBATCH --partition=gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:rtxa4000:2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
+#SBATCH --time=04:00:00
+#SBATCH --output=pmcs-mics-smoke-%j.out
+#SBATCH --error=pmcs-mics-smoke-%j.err
+set -euo pipefail
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate pmcs
+cd "$HOME/pmcs"
+EXPECTED_SOURCE_COMMIT="676f5bbe61ee94f66c3174ed0eaaea28e0add784"
+git cat-file -e "${EXPECTED_SOURCE_COMMIT}^{commit}" || {
+    echo "ERROR: reviewed source commit is unavailable: $EXPECTED_SOURCE_COMMIT"
+    exit 1
+}
+if ! git diff --quiet "$EXPECTED_SOURCE_COMMIT" -- \
+    options.py train_federated.py dataset/datasets.py \
+    utils/selection.py utils/metrics.py utils/encoder_coverage.py \
+    scripts/audit_full_run.py tests/test_selection.py; then
+    echo "ERROR: experiment source differs from reviewed commit $EXPECTED_SOURCE_COMMIT"
+    exit 1
+fi
+DATA_SEED=20260905
 SPLIT=A
 K=2
 MODEL_SEED=42
