@@ -47,6 +47,7 @@ import numpy as np
 __all__ = ['RoundPlan', 'CoverageLog', 'make_selector', 'SELECTORS']
 
 
+# ===================================================================== plan
 @dataclass
 class RoundPlan:
     train: list                       # clients that run local training
@@ -63,6 +64,7 @@ class RoundPlan:
         return sorted(m for m in out if m < M)
 
 
+# ===================================================================== log
 class CoverageLog:
     """Everything the supervisor asked for, recorded per round.
 
@@ -325,7 +327,12 @@ class MFedMC(_Base):
             pn, sn = self._norm(phi), self._norm(size)
             P = {m: self.a_s * pn[m] + self.a_c * (1 - sn[m]) + self.a_r * rec[m]
                  for m in held}
-            top = sorted(held, key=lambda m: (-P[m], m))[:self.gamma]
+            # ties broken AT RANDOM, as Cho et al. specify for pow-d. With a
+            # crude Shapley stand-in (constant across clients, equal encoder
+            # sizes) exact ties DO occur, and index-order tie-breaking would
+            # freeze one modality out entirely -- an artefact, not a finding.
+            jit = self.rng.random(len(held))
+            top = [held[i] for i in np.lexsort((jit, [-P[m] for m in held]))][:self.gamma]
             upload[k] = set(top)
             for m in top:
                 self.last_up[k, m] = t
