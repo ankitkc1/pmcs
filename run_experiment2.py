@@ -169,6 +169,12 @@ def main():
 
 # ============================================================ integration
 def integrate():
+    def integrate():
+    """Placeholder for future integration with the real training loop."""
+    raise NotImplementedError(
+        "Live training integration has not been implemented. "
+        "Use the CPU dry-run simulator for now."
+    )
 
 
 if __name__ == '__main__':
