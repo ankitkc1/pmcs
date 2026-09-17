@@ -158,24 +158,27 @@ def main():
     print('=' * 104)
     print(f'{"method":34}' + ''.join(f'{m:>10}' for m in MODS))
     for label, s in rows:
-        print(f'{label:34}'
-              + ''.join(f'{g:10d}' for g in s['held_minus_updated']))
-    print('\nA positive entry is a round in which an aggregating client HELD that')
-    print('encoder and did not upload it. Only MFedMC can be non-zero here, and')
-    print('no published evaluation reports this column.')
+            print(
+                f'{label:34}'
+                + ''.join(f'{g:10d}' for g in s['held_minus_updated'])
+            )
 
-    print(f'\nwrote per-round JSON to {a.outdir}/')
+        print('\nA positive entry is a round in which an aggregating client HELD that')
+        print('encoder and did not upload it. Only MFedMC can be non-zero here, and')
+        print('no published evaluation reports this column.')
+
+        print(f'\nwrote per-round JSON to {a.outdir}/')
 
 
-# ============================================================ integration
-def integrate():
+    # ============================================================ integration
+
     def integrate():
-    """Placeholder for future integration with the real training loop."""
-    raise NotImplementedError(
-        "Live training integration has not been implemented. "
-        "Use the CPU dry-run simulator for now."
-    )
+        """Placeholder for future integration with the real training loop."""
+        raise NotImplementedError(
+            "Live training integration has not been implemented. "
+            "Use the CPU dry-run simulator for now."
+        )
 
 
-if __name__ == '__main__':
-    main()
+    if __name__ == "__main__":
+        main()
