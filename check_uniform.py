@@ -32,38 +32,82 @@ def _walk(obj, path=''):
             yield from _walk(v, f'{path}[{i}]')
 
 
+def _as_round_sequence(node):
+    """Accept either a list indexed by round, or a dict keyed by round NUMBER
+    AS A STRING -- which is what json.dump produces for an int-keyed dict, and
+    what this project's metrics.json actually contains."""
+    if isinstance(node, list):
+        return node
+    if isinstance(node, dict) and node:
+        try:
+            return [node[k] for k in sorted(node, key=lambda s: int(s))]
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _rows_from(seq):
+    """seq is a per-round sequence; each entry is either [k1, k2] or a dict
+    carrying that list under one of SEL_KEYS."""
+    rows = []
+    for item in seq:
+        if isinstance(item, dict):
+            item = next((item[k] for k in SEL_KEYS if k in item), None)
+        if not isinstance(item, (list, tuple)) or len(item) != K:
+            return None
+        if not all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                   for x in item):
+            return None
+        rows.append([int(x) for x in item])
+    return rows or None
+
+
 def find_selections(doc):
-    """Return (rounds x K) int array of 0-based client ids, and the path used."""
+    """Return (rounds x K) int array of 0-based client ids, and the path used.
+
+    Tries the known paths in this project's schema first, then falls back to a
+    generic search that handles both list- and dict-keyed round containers.
+    """
+    candidates = [('participation.selected_by_round',
+                   doc.get('participation', {}).get('selected_by_round')),
+                  ('rounds', doc.get('rounds'))]
+    for path, node in candidates:
+        seq = _as_round_sequence(node)
+        rows = _rows_from(seq) if seq else None
+        if rows and len(rows) >= 10:
+            return _normalise(rows), path
+
     best = None
     for path, v in _walk(doc):
-        if not isinstance(v, list) or len(v) < 10:
+        seq = _as_round_sequence(v)
+        if not seq or len(seq) < 10:
             continue
-        rows = []
-        for item in v:
-            if isinstance(item, (list, tuple)) and len(item) == K \
-                    and all(isinstance(x, (int, float)) for x in item):
-                rows.append([int(x) for x in item])
-            elif isinstance(item, dict):
-                for key in SEL_KEYS:
-                    if key in item and isinstance(item[key], (list, tuple)) \
-                            and len(item[key]) == K:
-                        rows.append([int(x) for x in item[key]])
-                        break
-                else:
-                    rows = []
-                    break
-            else:
-                rows = []
-                break
-        if rows and len(rows) >= 10:
-            if best is None or len(rows) > len(best[0]):
-                best = (rows, path)
+        rows = _rows_from(seq)
+        if rows and (best is None or len(rows) > len(best[0])):
+            best = (rows, path)
     if best is None:
         return None, None
-    rows = np.array(best[0], int)
-    if rows.min() == 1 and rows.max() == N:          # 1-based -> 0-based
-        rows = rows - 1
-    return rows, best[1]
+    return _normalise(best[0]), best[1]
+
+
+def _normalise(rows):
+    a = np.array(rows, int)
+    if a.min() == 1 and a.max() == N:                # 1-based -> 0-based
+        a = a - 1
+    return a
+
+
+def find_participation(doc):
+    """Recorded participation counts, if the file states them. Used as an
+    independent cross-check that the selection parse is correct."""
+    node = doc.get('participation', {}).get('rounds_participated')
+    if isinstance(node, dict) and len(node) == N:
+        try:
+            return np.array([int(node[k])
+                             for k in sorted(node, key=lambda s: int(s))])
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 def find_sizes(doc):
@@ -123,12 +167,22 @@ def main(paths):
             continue
         sizes, spath = find_sizes(doc)
         part = np.array([(sel == k).sum() for k in range(N)])
+
+        # cross-check the parse against the counts the file states itself
+        stated = find_participation(doc)
+        if stated is not None and not np.array_equal(stated, part):
+            print(f'!! {p}: parsed selections disagree with the file\'s own')
+            print(f'   rounds_participated. parsed {part.tolist()}')
+            print(f'   stated {stated.tolist()} -- not using this run.')
+            continue
+        check = 'cross-checked vs rounds_participated' if stated is not None \
+            else 'no stated counts to cross-check against'
+
         runs.append(dict(path=p, T=len(sel), part=part, sizes=sizes,
                          where=where, spath=spath))
         print(f'loaded {p}\n       selections from "{where}"  '
-              f'{len(sel)} rounds'
-              + (f'   sizes from "{spath}"' if sizes is not None else
-                 '   (no client sizes found)'))
+              f'{len(sel)} rounds   {check}'
+              + (f'   sizes from "{spath}"' if sizes is not None else ''))
     if not runs:
         raise SystemExit('nothing to test')
 
@@ -229,7 +283,7 @@ def main(paths):
         print('    ONE OUTLIER SEED, NOT A BIASED SAMPLER. The combined spread is')
         print('    wide, but the seeds disagree about which clients are favoured,')
         print('    which is what chance looks like — a sampler bias would repeat.')
-        worst = int(np.argmax(ps[::-1]) if False else int(np.argmin(ps)))
+        worst = int(np.argmin(ps))
         print(f'    Driven by {runs[worst]["path"]} (p = {ps[worst]:.4f}).')
         print('    Action: none to the code. But do NOT quote a single seed\'s')
         print('    encoder coverage as "the" uniform baseline — report the')
