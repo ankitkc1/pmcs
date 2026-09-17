@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
 import itertools
@@ -34,17 +35,20 @@ def pearson(a, b):
 
 
 def ranks(x):
-    return np.argsort(np.argsort(np.asarray(x, float))).astype(float)
-
-
-def exact_perm_p(x, y, stat=pearson):
-    """Exact one-sided permutation test. n = 8 so 8! = 40320 — enumerable."""
-    obs = stat(x, y)
-    y = np.asarray(y, float)
-    ge = sum(1 for p in itertools.permutations(range(len(y)))
-             if stat(x, y[list(p)]) >= obs)
-    return obs, ge / np.math.factorial(len(y)) if hasattr(np, 'math') \
-        else (obs, ge / 40320)
+    """Midranks — ties share the average rank. The modality counts contain
+    ties (4,3,3,2,2,1,2,1), so index-order ranking would fabricate an
+    ordering that is not in the data and inflate Spearman."""
+    x = np.asarray(x, float)
+    order = np.argsort(x)
+    r = np.empty(len(x), float)
+    i = 0
+    while i < len(x):
+        j = i
+        while j + 1 < len(x) and x[order[j + 1]] == x[order[i]]:
+            j += 1
+        r[order[i:j + 1]] = (i + j) / 2.0 + 1.0
+        i = j + 1
+    return r
 
 
 def _fact(n):
