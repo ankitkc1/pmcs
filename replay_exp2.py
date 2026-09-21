@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
 import glob
@@ -29,8 +30,16 @@ CONFIGS = [
     ('powd',        'Power-of-Choice  d=2K',            dict(d_mult=2), True),
     ('powd',        'Power-of-Choice  d=N',             dict(d_mult=10), True),
     ('rpowd',       'rpow-d  (stale loss, no probe)',   dict(d_mult=2), True),
-    ('mmic',        'MMiC  Banzhaf  tau=1',             dict(tau=1.0, theta=0.0), True),
-    ('mmic',        'MMiC  Banzhaf  tau=4 (sharper)',   dict(tau=4.0, theta=0.0), True),
+    ('mmic',        'MMiC  Banzhaf  tau=1',             dict(tau=1.0), True),
+    ('mmic',        'MMiC  Banzhaf  tau=4 (sharper)',   dict(tau=4.0), True),
+    # --- submodular family. 'perf' and 'mask' are two substitutes for the
+    #     gradient space these methods actually use; both are reported
+    #     because the choice of space changes the answer.
+    ('divfl',    'DivFL  [dissim: perf]',      dict(feature='perf'), True),
+    ('divfl',    'DivFL  [dissim: mask]',      dict(feature='mask'), True),
+    ('subtrunc', 'SubTrunc lam=.95 [perf]',    dict(feature='perf', lam=0.95, b=1.10), True),
+    ('unionfl',  'UnionFL mu=1 w=5 [perf]',    dict(feature='perf', mu=1.0, window=5), True),
+    ('unionfl',  'UnionFL mu=1 w=5 [mask]',    dict(feature='mask', mu=1.0, window=5), True),
     # MFedMC has TWO filters and they must be separated, or the "control" is
     # not a control:
     #   gamma  upload filter    -- each client sends only its top-gamma encoders
@@ -73,7 +82,7 @@ def load(path):
     if not items:
         return None
 
-    sel, ev_t, ev_loss = {}, [], []
+    sel, ev_t, ev_loss, ev_reg = {}, [], [], []
     for t, r in items:
         if not isinstance(r, dict):
             continue
@@ -81,19 +90,27 @@ def load(path):
         if 'selected_clients' in r:
             sel[t] = [int(x) for x in r['selected_clients']]
         if 'dice_matrix' in r:
-            d = np.asarray(r['dice_matrix'], float)
-            d = d.mean(1) if d.ndim == 2 else d
+            raw = np.asarray(r['dice_matrix'], float)
+            d = raw.mean(1) if raw.ndim == 2 else raw
             if d.shape[0] == N and np.isfinite(d).all():
                 ev_t.append(t)
                 ev_loss.append(1.0 - d)          # monotone; ranking is the point
+                # per-REGION Dice: the feature space DivFL's dissimilarity
+                # matrix is built from, since gradients were never logged.
+                ev_reg.append(raw if raw.ndim == 2 else np.repeat(d[:, None], 3, 1))
     if not ev_t or not sel:
         return None
     ev_t, ev_loss = np.array(ev_t), np.array(ev_loss)
+    ev_reg = np.array(ev_reg)
     T = max(sel) + 1
 
     def loss_at(t):
         i = int(np.searchsorted(ev_t, t, side='right') - 1)
         return ev_loss[max(i, 0)]                # before first eval: use first
+
+    def feat_at(t):
+        i = int(np.searchsorted(ev_t, t, side='right') - 1)
+        return ev_reg[max(i, 0)]
 
     # coverage actually measured, straight from the recorded selections
     upd = np.zeros(M, int)
@@ -127,8 +144,9 @@ def load(path):
         return float(a @ b / d) if d > 0 else 0.0
     rho = float(np.mean([sp(ev_loss[i], ev_loss[-1])
                          for i in range(len(ev_t) - 1)]))
-    return dict(path=path, T=T, loss_at=loss_at, n_evals=len(ev_t),
-                measured_cov=upd, measured_stall=int(mx.max()), rho=rho)
+    return dict(path=path, T=T, loss_at=loss_at, feat_at=feat_at,
+                n_evals=len(ev_t), measured_cov=upd,
+                measured_stall=int(mx.max()), rho=rho)
 
 
 # ------------------------------------------------------------------ context
@@ -148,6 +166,11 @@ class ReplayContext:
     def local_loss(self, ids):
         v = self.run['loss_at'](self.t)
         return {int(k): float(v[int(k)]) for k in ids}
+
+    def client_features(self, t=None):
+        """(N, 3) per-region Dice — the measured stand-in for DivFL's
+        gradient space. See the note in fl_selectors._Submodular."""
+        return self.run['feat_at'](self.t if t is None else t)
 
     def shapley(self, k):
         held = [m for m in range(M) if MASK_A[k, m]]
