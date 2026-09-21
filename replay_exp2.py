@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import glob
@@ -30,6 +29,8 @@ CONFIGS = [
     ('powd',        'Power-of-Choice  d=2K',            dict(d_mult=2), True),
     ('powd',        'Power-of-Choice  d=N',             dict(d_mult=10), True),
     ('rpowd',       'rpow-d  (stale loss, no probe)',   dict(d_mult=2), True),
+    ('mmic',        'MMiC  Banzhaf  tau=1',             dict(tau=1.0, theta=0.0), True),
+    ('mmic',        'MMiC  Banzhaf  tau=4 (sharper)',   dict(tau=4.0, theta=0.0), True),
     # MFedMC has TWO filters and they must be separated, or the "control" is
     # not a control:
     #   gamma  upload filter    -- each client sends only its top-gamma encoders

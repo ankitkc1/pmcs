@@ -1,42 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-    from fl_selectors import make_selector, CoverageLog
-
-SOURCES, and what was read
---------------------------
-Power-of-Choice   Cho, Wang & Joshi, "Client Selection in Federated Learning:
-                  Convergence Analysis and Power-of-Choice Selection
-                  Strategies", arXiv:2010.01243. Section 4 and Algorithms 1-2.
-MFedMC            Yuan, Han, Wang, Upadhyay & Brinton, "Communication-Efficient
-                  Multimodal Federated Learning: Joint Modality and Client
-                  Selection", arXiv:2401.16685v2. Algorithm 1, Eqs (8)-(21).
-
-THE ONE STRUCTURAL FACT THAT SHAPES THIS FILE
----------------------------------------------
-pow-d and MFedMC do not have the same shape.
-
-  pow-d    probes d candidates, then only m of them TRAIN.
-           -> partial participation in the usual sense.
-
-  MFedMC   EVERY client trains every round (Algorithm 1, "Local Learning:
-           for each client k in parallel"). The saving comes from each client
-           uploading only its top-gamma encoders, and from the server
-           aggregating only the top-delta lowest-loss clients.
-           -> NOT partial participation. It is an upload filter plus an
-              aggregation filter.
-
-So a selector cannot just return "which clients train". Each round is described
-by three sets, and different methods constrain different ones:
-
-    RoundPlan.train           clients that run local training
-    RoundPlan.upload[k]       which modality encoders client k sends
-    RoundPlan.aggregate_from  clients whose uploads enter the average
-
-Encoder m is aggregated in round t  <=>  some k in aggregate_from has
-m in upload[k]. That single line is what the whole experiment measures, and it
-is invisible to any evaluation that only records which clients participated.
-
-"""
 from __future__ import annotations
 
 import json
@@ -152,9 +114,13 @@ class CoverageLog:
             'longest_client_wait': int(self.max_cli_gap.max()),
             'contacted_per_round': float(np.mean([r['contacted'] for r in self.rows])),
             'probe_passes_total': int(sum(r['probe_passes'] for r in self.rows)),
-            'GB_up': self.bytes_up / 2**30,
-            'GB_down': self.bytes_dn / 2**30,
-            'GB_total': (self.bytes_up + self.bytes_dn) / 2**30,
+            # DECIMAL GB (1e9), to match how metrics.json reports
+            # total_bytes_all_clients_all_rounds. Do not switch to 2**30:
+            # the dry run and the live run must use one convention or the
+            # communication column silently differs by 7.4% between them.
+            'GB_up': self.bytes_up / 1e9,
+            'GB_down': self.bytes_dn / 1e9,
+            'GB_total': (self.bytes_up + self.bytes_dn) / 1e9,
         }
 
     def save(self, path):
@@ -345,12 +311,77 @@ class MFedMC(_Base):
         return RoundPlan(train, upload, agg, contacted=train, probe_passes=0)
 
 
+class MMiC(_Base):
+    needs_ctx = False           # performance arrives through observe()
+
+    def __init__(self, manifest, K, seed=42, tau=1.0, theta=None,
+                 weights=None, **kw):
+        super().__init__(manifest, K, seed=seed, **kw)
+        self.tau = float(tau)
+        self.theta = None if theta is None else float(theta)   # None = adaptive
+        w = np.ones(self.N) if weights is None else np.asarray(weights, float)
+        self.w = w / w.sum()                    # w_i in Eq (8)
+        self.phi = np.zeros(self.N)             # Eq (10) core-member counter
+        self.T = np.zeros(self.N)               # times selected
+        self.perf = {}                          # last recorded a_{i,·}
+        self._A_sum, self._A_n = 0.0, 0         # running mean of A_{S,t}
+
+    def _theta(self):
+        """alpha^m_t. Fixed if given, else the cluster's own running mean."""
+        if self.theta is not None:
+            return self.theta
+        return self._A_sum / self._A_n if self._A_n else 0.0
+
+    def _probs(self):
+        score = self.tau * self.phi / np.maximum(self.T, 1.0)
+        e = np.exp(score - score.max())         # stable softmax, Eq (11)
+        return e / e.sum()
+
+    def plan_round(self, t, ctx=None):
+        p = self._probs()
+        S = sorted(int(k) for k in
+                   self.rng.choice(self.N, self.K, replace=False, p=p))
+        return RoundPlan(S, self._all(S), S, contacted=S)
+
+    def observe(self, t, plan, losses_after=None):
+        """Record performance, score the Banzhaf swing, update phi and T."""
+        S = list(plan.train)
+        for k in S:
+            self.T[k] += 1
+        if not losses_after:
+            return
+        # a = performance. losses_after is a LOSS, so performance is its
+        # negation; only differences are used, so the offset is irrelevant.
+        alpha = {}
+        for k in S:
+            if k not in losses_after:
+                continue
+            a_new = -float(losses_after[k])
+            alpha[k] = a_new - self.perf.get(k, a_new)   # 0 on first sight
+            self.perf[k] = a_new
+        if not alpha:
+            return
+        A = sum(self.w[k] * alpha[k] for k in alpha)     # Eq (8)
+        th = self._theta()                               # alpha^m_t
+        if A >= th:
+            for k in alpha:                              # Eq (9): is k pivotal?
+                if A - self.w[k] * alpha[k] < th:
+                    self.phi[k] += 1
+        self._A_sum += A                                 # threshold adapts AFTER
+        self._A_n += 1                                   # scoring this round
+
+    def state(self):
+        return {'phi': self.phi.tolist(), 'T': self.T.tolist(),
+                'theta': self._theta(), 'prob': self._probs().tolist()}
+
+
 SELECTORS = {
     'uniform': Uniform,
     'round_robin': RoundRobin,
     'powd': PowD,
     'rpowd': RPowD,
     'mfedmc': MFedMC,
+    'mmic': MMiC,
 }
 
 
