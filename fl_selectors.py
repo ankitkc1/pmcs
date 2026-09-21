@@ -1,5 +1,42 @@
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+
+import numpy as np
+
+__all__ = ['RoundPlan', 'CoverageLog', 'make_selector', 'SELECTORS']
+
+
+# ===================================================================== plan
+@dataclass
+class RoundPlan:
+    train: list                       # clients that run local training
+    upload: dict                      # client -> set of modality indices sent
+    aggregate_from: list              # clients whose uploads are averaged
+    contacted: list = field(default_factory=list)   # received the model at all
+    probe_passes: int = 0             # forward passes spent on selection only
+
+    def encoders_updated(self, M):
+        """Which encoders actually receive an update this round."""
+        out = set()
+        for k in self.aggregate_from:
+            out |= set(self.upload.get(k, ()))
+        return sorted(m for m in out if m < M)
+
+
+# ===================================================================== log
+class CoverageLog:
+    """Everything the supervisor asked for, recorded per round.
+
+    Two coverage series are kept deliberately:
+        held_cov[m]    rounds in which an aggregating client HELD m
+        upd_cov[m]     rounds in which m was actually AGGREGATED
+    The gap between them is what upload filtering costs, and no baseline
+    evaluation protocol records it.
+    """
 
     def __init__(self, manifest, dec_bytes, enc_bytes):
         self.mask = np.asarray(manifest)
