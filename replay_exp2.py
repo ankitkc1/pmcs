@@ -13,6 +13,10 @@ from fl_selectors import CoverageLog, make_selector
 MODS = ['FLAIR', 'T1ce', 'T1', 'T2']
 MASK_A = np.array([[1, 1, 1, 1], [1, 1, 1, 0], [1, 0, 1, 1], [1, 0, 1, 0],
                    [1, 0, 0, 1], [1, 0, 0, 0], [1, 0, 1, 0], [0, 0, 0, 1]])
+# Scenario 2: FLAIR and T1ce columns exchanged. Pool sizes are preserved as a
+# multiset {2, 4, 5, 7}; only which sequence occupies which pool changes.
+MASK_B = MASK_A[:, [1, 0, 2, 3]]
+MASK = MASK_A                 # rebound by set_scenario() before any load()
 N, M = 8, 4
 
 # measured payload, from private_param_fraction in metrics.json
@@ -21,8 +25,31 @@ DEC_B = 2_540_732 * 4.0
 
 # per-region modality impact -- ONLY used as MFedMC's Shapley stand-in, which
 # is why MFedMC is reported separately and labelled as such.
+# Rows are indexed by MODALITY, not by client, so this needs no scenario
+# variant: H2 holds that a sequence's contribution to a region is a property
+# of the sequence, not of which sites happen to hold it. The mask swap moves
+# the holders; shapley() picks up the change through MASK.
 IMPACT = np.array([[14.88, 12.60, 7.92], [-0.45, 13.98, 35.30],
                    [4.25, 5.59, 4.05], [2.40, 2.29, 3.48]])
+
+SCENARIO = 'A'                # set by set_scenario(), used only for labelling
+
+
+def set_scenario(tag):
+    """Bind the manifest. MUST be called before load() or run_one()."""
+    global MASK, SCENARIO
+    SCENARIO = 'A' if str(tag).upper() in ('A', '1') else 'B'
+    MASK = MASK_A if SCENARIO == 'A' else MASK_B
+    sizes = '  '.join('%s=%d' % (m, MASK[:, i].sum())
+                      for i, m in enumerate(MODS))
+    scarce = MODS[int(np.argmin(MASK.sum(0)))]
+    holders = [k for k in range(N) if MASK[k, MODS.index(scarce)]]
+    print(f'  SCENARIO {SCENARIO}   pools  {sizes}')
+    print(f'  scarce pool: {scarce}, held by clients {holders} '
+          f'({", ".join(str(int(MASK[k].sum())) for k in holders)} '
+          f'modalities each)')
+    return MASK
+
 
 CONFIGS = [
     ('uniform',     'uniform random  (CONTROL)',        {}, True),
@@ -117,7 +144,7 @@ def load(path):
     st = np.zeros(M, int)
     mx = np.zeros(M, int)
     for t in range(T):
-        hit = {m for k in sel.get(t, []) for m in range(M) if MASK_A[k, m]}
+        hit = {m for k in sel.get(t, []) for m in range(M) if MASK[k, m]}
         for m in range(M):
             if m in hit:
                 upd[m] += 1
@@ -173,13 +200,13 @@ class ReplayContext:
         return self.run['feat_at'](self.t if t is None else t)
 
     def shapley(self, k):
-        held = [m for m in range(M) if MASK_A[k, m]]
+        held = [m for m in range(M) if MASK[k, m]]
         return {m: float(IMPACT[m].sum()) for m in held}
 
 
 def run_one(name, kw, run):
-    sel = make_selector(name, MASK_A, 2, seed=42, **kw)
-    log = CoverageLog(MASK_A, DEC_B, ENC_B)
+    sel = make_selector(name, MASK, 2, seed=42, **kw)
+    log = CoverageLog(MASK, DEC_B, ENC_B)
     ctx = ReplayContext(run)
     for t in range(run['T']):
         ctx.set_round(t)
@@ -195,7 +222,8 @@ def main(paths):
         raise SystemExit('no usable metrics.json (need selected_clients + dice_matrix)')
 
     print('=' * 100)
-    print('EXPERIMENT 2 — REPLAY OVER MEASURED PER-CLIENT LOSSES')
+    print(f'EXPERIMENT 2 — REPLAY OVER MEASURED PER-CLIENT LOSSES '
+          f'— SCENARIO {SCENARIO}')
     print('=' * 100)
     for r in runs:
         print(f'  {r["path"].split("/")[-2][:60]:62} T={r["T"]}  '
@@ -212,6 +240,7 @@ def main(paths):
     print('=' * 100)
     print(f'  {"seed":<26}' + ''.join(f'{m:>9}' for m in MODS) + '   source')
     ok = True
+    scarce_idx = int(np.argmin(MASK.sum(0)))
     for r in runs:
         s = run_one('uniform', {}, r)
         name = r['path'].split('/')[-2][:24]
@@ -221,8 +250,13 @@ def main(paths):
               + ''.join(f'{v:9d}' for v in r['measured_cov']) + '   MEASURED')
         # replayed uniform uses a different RNG stream, so it is a different
         # uniform draw -- agreement means "same distribution", not "same seq"
-        ok &= abs(int(s['encoder_updates'][1]) - int(r['measured_cov'][1])) < 25
-    print('\n  Replayed uniform draws a different random sequence than your run,')
+        # compare on the SCARCE pool, which is the one the claim rests on and
+        # which moves between scenarios (T1ce under A, FLAIR under B)
+        ok &= abs(int(s['encoder_updates'][scarce_idx])
+                  - int(r['measured_cov'][scarce_idx])) < 25
+    print(f'\n  Compared on the scarce pool ({MODS[scarce_idx]}, '
+          f'n={int(MASK[:, scarce_idx].sum())}).')
+    print('  Replayed uniform draws a different random sequence than your run,')
     print('  so these should MATCH IN LEVEL, not exactly. Large agreement means')
     print('  the coverage machinery is sound.')
     print('  VERDICT:', 'machinery sound' if ok else
@@ -231,7 +265,7 @@ def main(paths):
     # ---- the table
     for r in runs:
         print('\n' + '=' * 100)
-        print(f'TABLE  {r["path"].split("/")[-2][:70]}')
+        print(f'TABLE  [scenario {SCENARIO}]  {r["path"].split("/")[-2][:60]}')
         print('=' * 100)
         print(f'  {"method":36}' + ''.join(f'{m:>8}' for m in MODS)
               + f'{"worst":>7}{"stall":>7}{"cJain":>7}{"wait":>6}'
@@ -262,12 +296,27 @@ def main(paths):
     print('  Replay cannot capture the feedback by which a starved encoder')
     print('  raises its holders\' loss and makes them selectable again; a live')
     print('  run is required to settle that, and is in progress."')
+    print()
+    print(f'  Run BOTH scenarios and report them side by side. The pool-size')
+    print(f'  correlation is invariant to the exchange; the impact correlation')
+    print(f'  is not. A criterion whose relationship to modality importance')
+    print(f'  changes sign when the manifest is relabelled was never tracking')
+    print(f'  importance -- it was tracking availability.')
 
 
 if __name__ == '__main__':
-    args = sys.argv[1:]
+    argv = sys.argv[1:]
+    tag = next((a.split('=')[1] for a in argv if a.startswith('--scenario=')),
+               None)
+    args = [a for a in argv if not a.startswith('--scenario')]
     paths = sorted(p for a in args for p in glob.glob(a)) or sorted(
         glob.glob('results/*K2_150r_seed*/metrics.json'))
     if not paths:
-        raise SystemExit('usage: python replay_exp2.py <metrics.json> ...')
+        raise SystemExit('usage: python replay_exp2.py <metrics.json> ... '
+                         '[--scenario=A|B]')
+    if tag is None:
+        # infer from the path, so split B can never be scored on the A mask
+        tag = 'B' if any(('splitB' in p) or ('split_B' in p) or ('_B_' in p)
+                         for p in paths) else 'A'
+    set_scenario(tag)
     main(paths)

@@ -10,8 +10,12 @@ import numpy as np
 from fl_selectors import CoverageLog, make_selector
 
 MODS = ['FLAIR', 'T1ce', 'T1', 'T2']
-MASK = np.array([[1, 1, 1, 1], [1, 1, 1, 0], [1, 0, 1, 1], [1, 0, 1, 0],
-                 [1, 0, 0, 1], [1, 0, 0, 0], [1, 0, 1, 0], [0, 0, 0, 1]])
+# MASK = np.array([[1, 1, 1, 1], [1, 1, 1, 0], [1, 0, 1, 1], [1, 0, 1, 0],
+#                  [1, 0, 0, 1], [1, 0, 0, 0], [1, 0, 1, 0], [0, 0, 0, 1]])
+MASK_A = np.array([[1, 1, 1, 1], [1, 1, 1, 0], [1, 0, 1, 1], [1, 0, 1, 0],
+                   [1, 0, 0, 1], [1, 0, 0, 0], [1, 0, 1, 0], [0, 0, 0, 1]])
+MASK_B = MASK_A[:, [1, 0, 2, 3]]
+MASK = MASK_B if any('splitB' in a for a in sys.argv[1:]) else MASK_A
 N, M, K = 8, 4, 2
 ENC_B = np.full(M, 1_466_496 * 4.0)
 DEC_B = 2_540_732 * 4.0

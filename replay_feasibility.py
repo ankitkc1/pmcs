@@ -56,6 +56,7 @@ def spearman(a, b):
         o = np.argsort(x)
         r = np.empty(len(x))
         i = 0
+        MASK_B = MASK_A[:, [1, 0, 2, 3]]
         while i < len(x):
             j = i
             while j + 1 < len(x) and x[o[j + 1]] == x[o[i]]:
